@@ -1,17 +1,22 @@
 # TESTING.md — correctness, deadlock and sanity harness for `collectives/` (design, no code)
 
-The remote agent implements this design under `collectives/harness/`. Nothing here depends on the
-server; the server protocol and tool versions are recorded in `CLAUDE.md`.
+Roadmap tasks C1 (harness, build matrix), C2–C3 (correctness, §2–3) and C4 (§4–6) implement this design
+under `collectives/harness/` (`ROADMAP.md`). Nothing here depends on the server; the server protocol is
+`../../docs/ENVIRONMENT.md`, tool versions are recorded in `CLAUDE.md` → *Tooling*. Builds run through
+`tools/run --no-gpu`, GPU runs through `tools/run --profile --lock-sm-mhz <LOCK>` on GPU 3; the vendored
+microbench harness (`../../common/h100mb/`, `../../docs/REUSE.md`) provides the CSV writer, run registry,
+device checks and clock notes.
 
 ## 1. Build matrix
 
 One translation unit per (file, N, M, T): `harness/main.cu` does `#include COLLECTIVE_FILE` and is compiled as
 
 ```
-nvcc -arch=sm_90a -std=c++17 -O3 -lineinfo -lcuda \
+nvcc -arch=sm_90a -std=c++17 -O3 -lineinfo -Xptxas -v -I ../common/h100mb \
      -DCOLLECTIVE_FILE='"../<file>.cu"' -DCLUSTER_N=<N> -DMSG_ELEMS=<M> -DELEM_T=<T> \
-     -o build/<file>__N<N>_M<M>_<T> harness/main.cu
+     -o build/<file>__N<N>_M<M>_<T> harness/main.cu -L$CUDA_HOME/lib64/stubs -lcuda -lnvidia-ml
 ```
+(run from `collectives/` inside `tools/run --no-gpu`; `-lnvidia-ml` is needed by the vendored `host.hpp`).
 
 | Axis | Values |
 |---|---|
@@ -40,8 +45,10 @@ Expected compile failures (record them as `SKIP:static_assert` / `SKIP:smem`, ne
    readable via a *separate* non-blocking stream copy (they may not be), and `_exit(3)`. The driver
    script runs each configuration as a child process (`subprocess` with its own timeout) so a hang never
    blocks the sweep.
-4. Copy `out`, `ts`, `smid` back; compare against the host reference (§3); print one CSV line
-   `file,N,M,T,rep,status,max_abs_err,max_rel_err,latency_ns` where `latency_ns = max_r ts[r*32+1] - min_r ts[r*32+0]`.
+4. Copy `out`, `ts`, `smid` back; compare against the host reference (§3); write one CSV row
+   `file,N,M,T,rep,status,max_abs_err,max_rel_err,latency_ns` where `latency_ns = max_r ts[r*32+1] - min_r ts[r*32+0]`,
+   preceded by the mandatory columns (`hb::with_mandatory`, `../../docs/ENVIRONMENT.md` §5) and appended to
+   `results/correctness.csv` with `hb::CsvWriter` (flush per launch).
 5. Repeat the launch `REPS` times (default 200) in the same process without re-initialising `in`, checking
    `out` every time: intermittent failures indicate a race. Re-run the whole configuration 3 times in
    fresh processes to vary SM placement (`smid` differs between launches).
@@ -60,7 +67,7 @@ Expected compile failures (record them as `SKIP:static_assert` / `SKIP:smem`, ne
 ## 4. Deadlock and race checks
 
 - `compute-sanitizer --tool memcheck` on every passing configuration (catches out-of-range DSMEM
-  addresses from wrong `mapa` offsets).
+  addresses from wrong `mapa` offsets). `compute-sanitizer` ships in the microbench image; use few reps.
 - `compute-sanitizer --tool racecheck` and `--tool synccheck` where the tool supports cluster-scope
   barriers on the installed version; record "unsupported" otherwise.
 - Deadlock = watchdog expiry (§2.3). Typical causes to check in the file: an mbarrier armed with the
@@ -71,10 +78,14 @@ Expected compile failures (record them as `SKIP:static_assert` / `SKIP:smem`, ne
 ## 5. Sanity checks on the performance side (before the sweep)
 
 - Stamps: every rank must have `ts[1] > ts[0]` and monotone round stamps; `smid` values must be N
-  distinct SMs, all inside one GPC (ranks of one cluster never share an SM).
+  distinct SMs, all inside one GPC (ranks of one cluster never share an SM). Use the **GPU-3** SM→GPC map
+  produced by the h100-microbench GPU-3 bring-up (`../../docs/ENVIRONMENT.md` §1), not the GPU-2 one.
+  `%globaltimer` ticks every 32 ns: equal stamps within one tick are not a monotonicity violation.
 - Traffic: for one mid-size configuration per file compare the DSMEM bytes measured by Nsight Compute
   (`docs/EXPERIMENTS.md` §4) with the per-CTA total in `README.md`; a mismatch > 10 % means the
-  README or the implementation is wrong — investigate, do not just annotate.
+  README or the implementation is wrong — investigate, do not just annotate. ncu exports only kernel-wide
+  rollups (`.sum/.avg/.max/.min`, no per-SM instances): compare `.sum` with N × the per-CTA model and use
+  `.max/.avg` for asymmetric (rooted) algorithms; subtract a same-grid baseline launch.
 - Flakiness: latency spread (p90/p50) across 200 reps should be < 20 % with locked clocks.
 
 ## 6. What "done" means

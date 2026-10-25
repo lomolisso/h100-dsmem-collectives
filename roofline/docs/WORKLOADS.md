@@ -5,16 +5,31 @@ A recurring finding: **no artifact ships an "off-chip" variant of its DSMEM coll
 counterpart is always either the repo's own unfused / non-cluster kernels or the same kernel built with
 cluster size 1. Manifests live in `../workloads/`.
 
-## 0. Priority order (value vs effort)
-1. `credit_*` (6): one binary per workload, both variants in one run, no Python stack.
-2. `dak_gemm_multicast`: exact like-for-like pair in one extension.
-3. `clusterfusion_llama2_7b_decoder`: the headline LLM workload, three variants.
-4. `deepgemm_fp8_gemm_multicast`: needs a two-line heuristic patch and a rebuild.
-5. `hpcops_topk_cluster8`: needs the hpc-ops wheel; integer roofline.
-6. `clusterfusion_rmsnorm`: small memory-bound sanity point.
-7. `clusterfusion_deepseek_v2_lite_mla`: the unfused baseline must be written.
-8. `hpcops_rmsnorm_lamport`: multi-GPU op; only if world size 1 is accepted.
-9. `fa4_bwd_2cta_ds_exchange`: Blackwell-only, reported from the paper.
+## 0. Priority order (value vs effort) and roadmap task (`../ROADMAP.md`)
+1. `credit_*` (6): one binary per workload, both variants in one run, no Python stack. → **R2**
+2. `dak_gemm_multicast`: exact like-for-like pair in one extension. → **R3**
+3. `clusterfusion_llama2_7b_decoder`: the headline LLM workload, three variants. → **R4**
+4. `deepgemm_fp8_gemm_multicast`: needs a two-line heuristic patch and a rebuild. → **R5**
+5. `hpcops_topk_cluster8`: needs the hpc-ops wheel; integer roofline. → **R6**
+6. `clusterfusion_rmsnorm`: small memory-bound sanity point. → **R4** (same artifact build as 3)
+7. `clusterfusion_deepseek_v2_lite_mla`: the unfused baseline must be written. → **R7**
+8. `hpcops_rmsnorm_lamport`: multi-GPU op; only if world size 1 is accepted. → **R6** (same wheel as 5)
+9. `fa4_bwd_2cta_ds_exchange`: Blackwell-only, reported from the paper. → **R8**
+
+**Build conventions inside the roofline image** (`../../docs/ENVIRONMENT.md` §3, `../CLAUDE.md` Rules). The
+build lines below and in the manifests are the artifacts' own instructions, written without running them;
+the workload tasks translate them:
+- Every variant is built in its own git worktree of the submodule (`roofline/build/src/<manifest>__<variant>/`),
+  with the manifest's patch applied there; `third_party/<repo>` stays clean.
+- `pip install -e .` / `pip install dist/*.whl` at run time is lost (`--rm` containers): build in-tree
+  (`python setup.py build_ext --inplace`, `make pyext`) or `pip install --no-deps --no-build-isolation
+  --prefix roofline/build/pyenv/<manifest>__<variant>`, and select the variant through `PYTHONPATH`.
+  Third-party Python packages (flashinfer, …) belong in the image, not in a build step.
+- DAK's `setup.sh` installs CUTLASS through conda: use the CUTLASS headers available in the image (or
+  `third_party/hpc-ops/3rd/cutlass/include`) instead; no conda in the image unless R0 decides otherwise.
+- hpc-ops needs CUDA ≥ 12.9 and C++20 (the image has 12.9.1); ClusterFusion needs CUDA ≥ 12.4.
+- JIT caches (DeepGEMM, Triton, torch extensions) go to `roofline/build/cache/` on NFS when they must
+  survive between runs.
 
 ## 1. ClusterFusion — Llama-2-7B fused decoder (`clusterfusion_llama2_7b_decoder`)
 - **Computation** (one token, fp16): RMSNorm → QKV GEMV (4096 → 3·4096) → RoPE → flash-decoding over the

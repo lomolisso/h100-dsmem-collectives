@@ -17,7 +17,7 @@ Lines that touch a cluster primitive are tagged `// [DSMEM] ...`. Code below the
 | `fp8_gemm_1d2d_tma_multicast__deepseek_v3_moe__deepgemm.cu` | DeepGEMM `impls/sm90_fp8_gemm_1d2d.cuh` | 2 | rooted: TMA multicast of A or B tiles; pairwise remote arrives on empty barriers |
 | `flash_bwd_2cta_ds_exchange__fa4.cu` (+ `.excerpt.py`) | FlashAttention-4 `flash_bwd_sm100.py` (CuTe-DSL, sm100) | 2 | AlltoAll pairwise exchange of half of dS (remote expect_tx + bulk push), relay arrive on leader |
 
-Build notes (the Task-3 agent compiles only `collectives/`; these are for reference):
+Build notes (the collectives roadmap compiles only `collectives/`; the roofline roadmap builds these workloads from `third_party/`, not from these files; the notes are for reference):
 - ClusterFusion, CREDIT, FA4 port: `nvcc -arch=sm_90a -std=c++17 -lcuda`.
 - hpc-ops files: add `-I third_party/hpc-ops -std=c++20` (they include `src/topk/*.h`, `src/utils/*`).
 - DAK: `-I third_party/hpc-ops/3rd/cutlass/include -DDAK_SM_ARCH=90 -std=c++20` (CuTe/CUTLASS).

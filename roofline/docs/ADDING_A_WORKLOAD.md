@@ -36,7 +36,20 @@ reported:                                # only when runnable: false
 notes: <traps, caveats>
 ```
 
+Conventions the runner (`roofline/harness/run_manifest.py`, written in roadmap task R2) applies:
+- `build.cwd` / `run.cwd` name the submodule; the runner executes them in that variant's git worktree
+  `roofline/build/src/<manifest>__<variant>/` with `build.patch` applied there, never in `third_party/`.
+  Patch files are named `patches/<manifest>__<variant>.patch` (the initial five use shorter names; keep
+  them, the manifest field is what counts).
+- `build.cmd` must leave the result in the worktree or under `roofline/build/pyenv/<manifest>__<variant>`
+  (no `pip install` into the image venv: containers are `--rm`); `run.cmd` gets that prefix on `PYTHONPATH`.
+- Commands that need a wrapper (`# agent script` in the initial manifests) point to a script under
+  `roofline/harness/workloads/<manifest>.py` that runs exactly one iteration of the variant on `{shape}`.
+- Everything runs through `roofline/tools/run` (`../../docs/ENVIRONMENT.md`).
+
 Checklist before a manifest is "done":
+0. Any new Python or system dependency is added to `roofline/docker/Dockerfile` (+ its lock file), the
+   image is rebuilt and re-tagged with `roofline/tools/build_image.sh`, and `docs/DESIGN.md` §6 lists it.
 1. Both `build` commands succeed from a fresh checkout (plus the referenced patch).
 2. The `run` command for every variant produces the output the `validate.reference` can check, and
    validation passes at the stated tolerance.

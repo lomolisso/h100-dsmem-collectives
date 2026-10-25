@@ -1,0 +1,227 @@
+# ROADMAP — roofline study (tasks R0–R8)
+
+Imported by `roofline/CLAUDE.md`. One conversation = one task, run in order. How a conversation starts and
+ends, the commit rule and the subagent rule: `../CLAUDE.md`. Environment: `../docs/ENVIRONMENT.md`.
+Reusable code: `../docs/REUSE.md`. Design: `docs/DESIGN.md` (methodology, binding), `docs/WORKLOADS.md`
+(per-workload facts and traps), `docs/ADDING_A_WORKLOAD.md` (manifest reference and done-checklist).
+
+## Task status
+Status values: `todo` · `in progress` (current conversation) · `in review` (committed locally, waiting for the
+user's review, not pushed) · `done` (approved and pushed). Update the row **before** the task's commit;
+"Key results" records what later tasks consume (numbers, file paths, decisions).
+
+| ID | Task | Manifests | Status | Key results for later tasks |
+|---|---|---|---|---|
+| R0 | Environment: submodules, roofline Docker image, `tools/run` wrapper | — | todo | |
+| R1 | Ceilings → `results/ceilings.csv` | — | todo | |
+| R2 | Manifest runner + the six CREDIT workloads | `credit_*` (6) | todo | |
+| R3 | DAK multicast GEMM | `dak_gemm_multicast` | todo | |
+| R4 | ClusterFusion Llama-2-7B decoder (+ layer scope) and RMSNorm | `clusterfusion_llama2_7b_decoder`, `clusterfusion_rmsnorm` | todo | |
+| R5 | DeepGEMM FP8 GEMM with TMA multicast | `deepgemm_fp8_gemm_multicast` | todo | |
+| R6 | hpc-ops cluster-8 top-k and Lamport RMSNorm | `hpcops_topk_cluster8`, `hpcops_rmsnorm_lamport` | todo | |
+| R7 | ClusterFusion DeepSeek-V2-Lite MLA (unfused baseline written here) | `clusterfusion_deepseek_v2_lite_mla` | todo | |
+| R8 | FA4 reported markers, final notebook, ncu cross-check, report | `fa4_bwd_2cta_ds_exchange` + all | todo | |
+
+## Dependencies
+```
+h100-microbench "GPU-3 bring-up" row (GPU lock value) ─┐  (needed for any GPU run)
+R0 ─► R1 ─► R2 ─► R3 ─► R4 ─► R5 ─► R6 ─► R7 ─► R8
+```
+R3–R7 depend only on R2 (the runner) and could run in any order; the order above is `docs/WORKLOADS.md` §0
+(value vs effort). R1 must be `done` before any figure is shown to the user. This roadmap does not depend on
+`../collectives/` (the DSMEM ceiling is measured in R1).
+
+## Shared facts for every task
+- Commands: after R0, `TR=roofline/tools/run` (from the repo root) wraps
+  `~/work/fa2026/iacoma/h100-microbench/tools/run` with the roofline image. Builds `$TR --no-gpu -- …`; GPU
+  runs `$TR --profile --lock-sm-mhz <LOCK> -- …` on GPU 3 (`<LOCK>`: h100-microbench `docs/context/10` §2).
+- Layout: `roofline/harness/` (runner, ceiling kernels, wrappers), `roofline/build/` (git-ignored: per-variant
+  source worktrees `build/src/<manifest>__<variant>/`, built extensions, `build/pyenv/`, JIT caches
+  `build/cache/`), `roofline/results/` (git-ignored except the files `CLAUDE.md` names).
+- The manifests' `build`/`run` commands were written without running anything (they still contain
+  `pip install -e .`, in-place `git apply` and `# agent script` placeholders). Each workload task rewrites its
+  manifests to the runner's conventions (worktree cwd, in-tree build, `PYTHONPATH`, real wrapper scripts
+  under `roofline/harness/workloads/<manifest>.py`) and keeps the YAML schema of `docs/ADDING_A_WORKLOAD.md`.
+- Every workload task ends with the `docs/ADDING_A_WORKLOAD.md` checklist satisfied for its manifests, the
+  notebook re-executed with the new markers, and the per-workload numbers (time, FLOPs, bytes per level,
+  intensity, speedup) in "Key results".
+- A variant that fails validation is not plotted: log it in `CLAUDE.md` → Change log and in "Key results".
+
+---
+
+## R0 — Environment
+**Goal.** A reproducible toolchain for all six artifacts, usable through `tools/run` with the same GPU
+safety, lock and clock handling as h100-microbench.
+
+**Prerequisites.** None for the image; the GPU smoke step needs the microbench GPU-3 bring-up `done`.
+
+**Read first.** `../docs/ENVIRONMENT.md` (all), `h100-microbench/docs/environment/README.md`,
+`h100-microbench/docker/{Dockerfile,entrypoint.sh}`, `h100-microbench/tools/{run,env,common.sh}`,
+`docs/DESIGN.md` §6, `docs/WORKLOADS.md` (build lines of every artifact), the artifacts' own READMEs /
+`setup.py` / `requirements*.txt` after step 1.
+
+**Steps.**
+1. `git submodule update --init` (check the pinned commits match `git submodule status`); DeepGEMM's own
+   `third-party/` submodules. Never commit inside a submodule.
+2. Dependency survey: for each artifact, the Python/CUDA/compiler requirements (ClusterFusion: CUDA ≥ 12.4,
+   flashinfer; hpc-ops: CUDA ≥ 12.9, C++20; DAK: `setup.sh` installs CUTLASS through conda — replace with the
+   CUTLASS headers in `third_party/hpc-ops/3rd/cutlass` or a pinned CUTLASS copy in the image; DeepGEMM:
+   `develop.sh`, JIT; Triton/torch.compile baselines for CREDIT's `scripts/run_local.py`). Pick one PyTorch
+   build for CUDA 12.9 that satisfies all of them and record the choice.
+3. `roofline/docker/Dockerfile`: `FROM` the current microbench image tag (pinned), add the survey's packages
+   into `/opt/venv` with a lock file (`roofline/docker/requirements.lock`), keep the microbench `ENTRYPOINT`.
+   A build script `roofline/tools/build_image.sh`: content-hash tag (Dockerfile + lock + base tag), refuses
+   below 40 GB free on the scratch volume, labels the image, removes only our previous roofline tags, never
+   prunes.
+4. One-line override in `~/work/fa2026/iacoma/h100-microbench/tools/common.sh`:
+   `IMAGE=${H100MB_IMAGE:-$IMAGE_REPO:cuda12.9.1-$IMAGE_TAG}`, honoured by `tools/run` only — make sure
+   `tools/env build` still builds the microbench image (unset `H100MB_IMAGE` there or keep a separate
+   variable). Commit it in h100-microbench separately (`tools: H100MB_IMAGE override for derived images`)
+   after the user approves; do not push it without approval.
+5. `roofline/tools/run`: `H100MB_IMAGE=<roofline tag> exec ~/work/fa2026/iacoma/h100-microbench/tools/run "$@"`,
+   plus `PYTHONPATH`/cache variables pointing into `roofline/build/`. `tools/run` passes only `HOME`, `USER`
+   and its own `H100MB_*` variables into the container (`h100-microbench/tools/run` l.54–79), so the wrapper
+   prefixes the command with `env PYTHONPATH=… TRITON_CACHE_DIR=… DG_JIT_CACHE_DIR=… …` (or the image sets
+   defaults with `ENV`). `image_present` in `tools/run` checks `$IMAGE`, so the override also covers it.
+6. Repository hygiene: `.gitignore` entries `roofline/build/`, `roofline/results/*` (with the force-added
+   exceptions), `common/h100mb` is tracked; `.claude/settings.json` (`../docs/ENVIRONMENT.md` §6, include
+   `roofline/tools/run`).
+7. Smoke (GPU 3): `torch.cuda.get_device_name()`, a 4096³ fp16 matmul, `import flashinfer`; build the CREDIT
+   binaries with `--no-gpu` (`make all CUDA_ARCH=sm_90a` in a worktree) and run one CREDIT shape.
+8. Fill `docs/DESIGN.md` §6 (versions of driver, CUDA, nvcc, ncu, PyTorch, flashinfer, Triton; image tag).
+
+**Deliverables.** `roofline/docker/{Dockerfile,requirements.lock}`, `roofline/tools/{build_image.sh,run}`,
+the microbench override commit, `.gitignore`, `.claude/settings.json`, DESIGN §6.
+
+**Done when.** The image builds from scratch with the script; the smoke test passes on GPU 3 under
+`--profile --lock-sm-mhz <LOCK>`; `tools/env build` in h100-microbench is unaffected. GPU time ≈ 10 min;
+image build ≈ 30–60 min.
+
+---
+
+## R1 — Ceilings → `results/ceilings.csv`
+**Goal.** Measured ceilings of DESIGN §2.1 on GPU 3 at the locked clock, plus datasheet reference rows.
+
+**Prerequisites.** R0 `done`; GPU-3 bring-up `done`.
+
+**Read first.** `docs/DESIGN.md` §2.1 and §5, `../docs/REUSE.md` (§2 table rows for `05`), the docstrings of
+`h100-microbench/experiments/05__memory_hierarchy_bandwidth/src/{bw_dram,bw_l2,bw_smem_l1}.cu`,
+h100-microbench `docs/context/07` (metric names), `docs/context/09` §1 (timers).
+
+**Steps.**
+1. Vendor `common/h100mb/` if collectives C1 has not (`../docs/REUSE.md` §1); copy `bw_common.hpp`
+   (`CleanL2`) and the needed kernels into `roofline/harness/ceilings/` with provenance comments.
+2. Memory ceilings: HBM read/write/copy (`k4`, 2 GiB, 4 × 132 × 1024 threads, `CleanL2` before each launch),
+   L2 read (`k3_direct`, 16–24 MiB working set), SMEM read (`k12`, slope method) — each × ≥ 5 launches after
+   warm-ups; cudaEvent rates net of the event floor (measure the floor on GPU 3).
+3. Compute ceilings (new kernels / scripts): FP32 FFMA chain (all SMs, ILP to saturate), INT32 IMAD chain,
+   FP16 and BF16 dense tensor core (cuBLAS 8192³ via torch, best of 10), FP8 e4m3 (`torch._scaled_mm` /
+   cuBLASLt, best of 10). Confirm the instruction mix with ncu (`sm__sass_thread_inst_executed_op_ffma_pred_on.sum`,
+   `sm__inst_executed_pipe_tensor_op_hmma.sum`) and the SASS (FFMA / IMAD / HGMMA).
+4. DSMEM ceiling (own microbenchmark, independent of `../collectives/`): every SM in a cluster of size
+   CS ∈ {2, 4, 8, 16}, max active clusters at 1 CTA/SM, each CTA streaming from a peer with
+   `ld.shared::cluster.v4` (pull) and with bulk `cp.async.bulk.shared::cluster` pushes; aggregate bytes/s
+   GPU-wide from `%globaltimer` + cudaEvent, cross-checked with the `dshared` byte counters. Report the best
+   CS and both directions.
+5. Datasheet rows (`source = datasheet`): HBM 3.9 TB/s, FP32 67 TFLOP/s, FP16/BF16 989, FP8 1979 TFLOP/s
+   (H100 NVL, boost clock). Note in the CSV `method` that measured rows are at the locked clock.
+6. `results/ceilings.csv` (DESIGN §5 schema, mandatory columns first) and a raw file per ceiling.
+7. Agent-only sanity: microbench 05 on GPU 2 measured HBM read 3.70 / write 3.62 TB/s, L2 read 7.7 TB/s,
+   SMEM 27.5 TB/s at 1635 MHz; a GPU-3 value far from these needs investigation (clocks, placement, flush).
+
+**Done when.** Every DESIGN §2.1 row has a measured value (or a recorded reason why not); the notebook's
+ceiling cell renders. GPU time ≈ 30 min.
+
+---
+
+## R2 — Manifest runner + the six CREDIT workloads
+**Goal.** One generic runner that takes a manifest from build to `points.csv`, proven on the simplest pairs.
+
+**Prerequisites.** R1 `done`.
+
+**Read first.** `docs/DESIGN.md` §2.2–§3 and §5, `docs/ADDING_A_WORKLOAD.md`, `docs/WORKLOADS.md` §4 and §0,
+the six `workloads/credit_*.yaml`, `third_party/CREDIT` README and `src/workloads/*.cu` CLI.
+
+**Steps.**
+1. `roofline/harness/run_manifest.py <manifest> [--variant] [--shape] [--stage build|validate|time|ncu|all]`:
+   - parse the YAML, evaluate `flops`/`int_ops`/`min_hbm_bytes` per shape;
+   - build: create `build/src/<manifest>__<variant>/` as a `git worktree` of the submodule at its pinned
+     commit, apply `build.patch` there, run `build.cmd` there (no edits in `third_party/`);
+   - validate: run the variant's validation, refuse to time a variant that fails;
+   - time: locked clock, L2 flush between iterations unless the artifact does it (CREDIT does not: wrap it),
+     20 warm-up + 100 reps, kernel durations from nsys or ncu `gpu__time_duration.sum`, p10/p50/p90;
+   - ncu: `--clock-control none --cache-control all --csv --page raw --print-units base`, `-k regex:` from the
+     manifest, one iteration per kernel of the sequence, byte metrics per level (DESIGN §2.2; one `lts__`
+     counter per pass, so expect several passes);
+   - append `points.csv` rows (mandatory columns first, DESIGN §5), register the run.
+2. CREDIT: rewrite the six manifests to the runner's conventions; record both `block_read` and `block_smem`
+   (`--profile-variant block` reports the faster one: read `block_name`), and every cluster size P ∈ {2,4,8}
+   (the DSMEM marker is the best P per shape, the others are kept as rows).
+3. Check: modelled bytes/element of the binary vs `dram__bytes`; FLOP formula vs FFMA/FADD/FMUL counters
+   within 10 % (explain any gap in "Key results").
+
+**Done when.** The six CREDIT manifests pass the `ADDING_A_WORKLOAD.md` checklist and appear in the notebook.
+GPU time ≈ 1 h.
+
+---
+
+## R3 — DAK multicast GEMM
+**Read first.** `docs/WORKLOADS.md` §7, `workloads/dak_gemm_multicast.yaml`, DAK `benchmark/benchmark_linear.py`,
+`app/python/layers/linearLayerMulticast.py`, `include/task/gemv_multicast.cuh`.
+**Key points.** `--offload 0`; tokens a multiple of 512; `NUM_SMS = 132` matches; the DSMEM variant needs
+`LinearMulticast(prefill=False)` (default `True` runs the non-multicast twin): write a wrapper rather than
+patching; replace the conda step of `setup.sh` with the image's CUTLASS; cuBLAS (`--type vanila`) as extra marker.
+**Done when.** Checklist satisfied for both roles + the cuBLAS marker. GPU time ≈ 30 min.
+
+## R4 — ClusterFusion Llama-2-7B decoder (+ layer scope) and RMSNorm
+**Read first.** `docs/WORKLOADS.md` §1 and §3, both manifests, ClusterFusion `tests/test_llama.py`,
+`tests/test_norm.py`, `include/H100/llama/{kernel_sglang.cuh,config.h}`, `chat/llama/model.py`,
+`patches/clusterfusion__cluster_size_1.patch`.
+**Key points.** Three variants (`unfused` → `fused_c1` control → `fused_c4`); `fused_c1` is untested upstream:
+validate against `unfused` first; only cluster sizes 1 and 4 are correct; validation on the attention output
+(`residual` is updated in place by every head cluster); layer scope adds FFN + residuals + second RMSNorm to
+both variants and reports the fraction of layer time in the fused region; time with ncu/nsys (dispatchers
+synchronise and re-encode TMA maps per call). RMSNorm: compare with `flashinfer.norm.rmsnorm`, **no**
+cluster-1 rebuild. Build in-tree (no `pip install -e`).
+**Done when.** Checklist satisfied for both manifests, operator and layer scope. GPU time ≈ 1 h.
+
+## R5 — DeepGEMM FP8 GEMM with TMA multicast
+**Read first.** `docs/WORKLOADS.md` §8, the manifest, `patches/deepgemm__force_cluster_1.patch`, DeepGEMM
+`csrc/jit_kernels/heuristics/sm90.hpp`, `tests/generators.py`, `deep_gemm/testing` (`bench_kineto`).
+**Key points.** The patch adds `DG_FORCE_CLUSTER_1`; confirm with `DG_PRINT_CONFIGS=1` that the DSMEM run
+really uses `cluster_m/cluster_n = 2` (only when the grid has > 1 wave) and the control uses 1; JIT cache under
+`build/cache/` on NFS; `DG_USE_NVIDIA_TOOLS=1` under ncu; dense shapes and the grouped MoE shape; cuBLASLt
+as extra marker.
+**Done when.** Checklist satisfied for every shape where the heuristic picks cluster 2 (list the others).
+GPU time ≈ 1 h.
+
+## R6 — hpc-ops cluster-8 top-k and Lamport RMSNorm
+**Read first.** `docs/WORKLOADS.md` §5–6, both manifests, both hpc-ops patches, `src/topk/topk_filtered.cu`
+(`choose_topk2048_plan`), `tests/test_topk.py`, `src/allreduce/fuse_allreduce_rmsnorm_low_latency.{h,cu}`.
+**Key points.** Top-k is an integer workload against the INT32 ceiling (`int_ops`); two non-DSMEM routes
+(padding `ke` to 17 rows, or the `use_cluster=false` patch); build the wheel in a worktree and install it
+under `build/pyenv/`. Lamport RMSNorm is `runnable: conditional`: first check whether the fused op accepts
+world size 1 on one GPU; if not, record that and skip the manifest (reported as not measurable).
+**Done when.** Top-k checklist satisfied; Lamport either satisfied or documented as skipped. GPU time ≈ 45 min.
+
+## R7 — ClusterFusion DeepSeek-V2-Lite MLA
+**Read first.** `docs/WORKLOADS.md` §2, the manifest, `../kernels/fused_mla_decoder_layer__deepseek_v2_lite__clusterfusion.cu`
+(docstring: shapes and dataflow), `patches/clusterfusion__deepseek_cluster_size_1.patch`.
+**Key points.** No upstream test exists: write the unfused torch/flashinfer baseline
+(`roofline/harness/workloads/deepseek_mla_unfused.py`: down-projections, RMSNorm, W_UK absorption, MQA
+decode over the latent cache, W_UV, O-proj) and validate the fused kernel against it before timing;
+compile-time `SEQ_LEN 4096`; nine TMA maps; `CLUSTER_SIZE 1` rebuild as control.
+**Done when.** Checklist satisfied, or the manifest is marked not measurable with the reason. GPU time ≈ 45 min.
+
+## R8 — FA4 reported markers, final notebook, cross-check, report
+**Read first.** `docs/WORKLOADS.md` §9, `workloads/fa4_bwd_2cta_ds_exchange.yaml`, `docs/DESIGN.md` §3.5 and
+§4, every earlier row's "Key results".
+**Steps.** Fill the FA4 `reported` block from the paper (B200 Fig. 6 / Table 3, compulsory-traffic intensity)
+and draw it as stars labelled "reported (B200)", separate from the H100 measurements; run the ncu
+`SpeedOfLight_RooflineChart` / `SpeedOfLight_HierarchicalTensorRooflineChart` sections for every DSMEM kernel
+and check them against the hand-computed points (10 %); finalise `analysis/roofline.ipynb` (setup cell with
+device, clock, versions, run_ids; figures 1–3 of DESIGN §4; per-workload table), execute it with
+`$TR --no-gpu -- jupyter nbconvert --execute --to notebook --inplace roofline/analysis/roofline.ipynb`;
+force-add `results/ceilings.csv` and `results/points.csv`; final report (CLAUDE.md Workflow step 5).
+**Done when.** Every manifest appears in the notebook (measured, reported, or listed as not measurable with
+the reason) and the notebook renders on GitHub without the raw data.

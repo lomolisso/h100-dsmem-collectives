@@ -1,12 +1,12 @@
 # CLAUDE.md — H100 verification and benchmarking of `collectives/`
 
-> **IMPORTANT — READ FIRST.** The Claude Code agent that runs this study on the shared H100 NVL
-> server MUST, before compiling or launching anything, update this file (section *H100 NVL server
-> protocol*) and `docs/EXPERIMENTS.md` (section *Tooling*) with the server's usage rules and the
-> tooling it sets up. The server is a shared resource with restrictions and particularities that are
-> not described here; discover them (ask the operator, read the server's own documentation, check
-> `nvidia-smi`, scheduler/queue tools, `/etc/motd`, module system) and record them so later sessions
-> follow the same protocol. Every GPU run must comply with what you write there.
+@ROADMAP.md
+
+> **IMPORTANT — READ FIRST.** The server protocol is known and binding: `../docs/ENVIRONMENT.md` (summary of
+> `h100-microbench/docs/environment/README.md`). Every build, run and notebook goes through
+> `~/work/fa2026/iacoma/h100-microbench/tools/run`, on **GPU 3**, with the locked SM clock for every timed or
+> ncu run. Do not invent another protocol; if something on the server contradicts that file, stop, tell the
+> user, and record the finding there.
 
 ## Scope
 
@@ -14,20 +14,38 @@ Only `collectives/` is in scope: every `<op>__<alg>__<src>.cu` must (1) compile 
 (2) produce correct results for every legal configuration, (3) never deadlock or race, and (4) be
 benchmarked for latency and bandwidth per `docs/EXPERIMENTS.md`, with figures in
 `analysis/dsmem_collectives.ipynb`. `kernels/` and `third_party/` are reference material and are not
-compiled here.
+compiled here. This study also owns what was planned as experiment 17 of h100-microbench
+(`h100-microbench/docs/experiments/17__dsmem_collectives.md`, reference input for task C7).
 
-## H100 NVL server protocol  *(to be filled by the remote agent)*
+## Starting a new conversation
+Follow `../CLAUDE.md` ("Starting a new conversation"): the task is the first row of the status table in
+`ROADMAP.md` that is not `done`; plan mode first; read the task card and the documents it lists.
 
-- Access / login, allowed hours, who else uses the GPU: _TODO_
-- How to check the GPU is free and how to reserve it (queue, lock file, `nvidia-smi`): _TODO_
-- Limits (max run time, memory, concurrent processes, ncu permission / `--clock-control`): _TODO_
-- Where to build and write results (scratch paths, quotas): _TODO_
-- Clean-up obligations: _TODO_
+## H100 NVL server protocol (binding; details in `../docs/ENVIRONMENT.md`)
 
-## Tooling  *(to be filled by the remote agent; mirror in docs/EXPERIMENTS.md)*
+- Access: edit, run agents and use git directly in this NFS checkout on `nishil-4xh100-01`; the GPUs are
+  shared with other users, ours are GPU 3 (default) and GPU 2 (only when the user names it).
+- Checking and reserving the GPU: `tools/run` runs the preflight (no foreign process, ≤ 1 GiB used, ≤ 5 %
+  utilisation, no other container given the GPU) and holds the cooperative lock
+  `/tmp/h100-gpu-locks/gpu3.lock` for the lifetime of its container. The lock is shared with h100-microbench:
+  one GPU job at a time; if it is held, wait and retry. Status: `make -C ~/work/fa2026/iacoma/h100-microbench gpu-status`.
+- Limits: `--profile` is required for ncu counters (`RmProfilingAdminOnly=1`) and for the clock lock
+  (`--lock-sm-mhz <LOCK>`, value from h100-microbench `docs/context/10` for GPU 3; GPU measurements wait
+  until its GPU-3 bring-up row is `done`). Containers need ≥ 2 GB free scratch. No run-time limit is
+  documented; keep sweeps restartable (skip configurations that already have a `complete` run) so an
+  interrupted run never has to start over.
+- Where to build and write: in-tree on NFS (`collectives/build/`, `collectives/results/`, both git-ignored);
+  never the container's `/tmp`.
+- Clean-up: none beyond `tools/run`'s own (`--rm` containers, lock released on exit). Never `docker run` by
+  hand, never prune, never touch other users' processes, containers or locks. Never delete results.
 
-- Driver / CUDA toolkit / `nvcc` version, Nsight Compute version, Python environment: _TODO_
-- Exact build and run commands used: _TODO_
+## Tooling (fill the run-time values when they are first used)
+
+- Image: the h100-microbench image (`h100-microbench:cuda12.9.1-<hash>`): CUDA 12.9.1, nvcc 12.9.86,
+  Nsight Compute 2025.2.1, Nsight Systems, compute-sanitizer, cuda-gdb, Python 3.12 (numpy, pandas,
+  matplotlib, scipy, jupyter). Record `tools/env verify --gpu 3 --profile` output once: _TODO (C1)_
+- Driver / exact image tag / commit of this repo and of the vendored harness (`common/h100mb/PROVENANCE.md`): _TODO (C1)_
+- Exact build and run commands used: _TODO (C1, then each task appends its own)_
 
 ## File contract (what the harness may rely on)
 
@@ -40,36 +58,47 @@ compiled here.
   allreduce `in/out[b*M .. b*M+M)`; allgather `in[b*M..)`, `out[b*N*M + r*M]`;
   reducescatter `in[b*N*M + j*M]`, `out[b*M..)`; alltoall `in[b*N*M + j*M]` → rank j, `out[b*N*M + r*M]`.
 - Timestamps: `ts[b*32 + 0]` entry (after the entry `cluster_sync`), `ts[b*32 + 1]` exit, `ts[b*32 + 2 + r]`
-  end of round r (where the algorithm has rounds); `smid[b]` = SM id of rank b. All in `%globaltimer` ns.
+  end of round r (where the algorithm has rounds); `smid[b]` = SM id of rank b. All in `%globaltimer` ns
+  (32 ns tick on this device: small-message latencies are quantised; report medians over reps).
 - `static_assert`s encode legal configurations (power-of-two N, N == 4, N == 2, N | M, 16-byte multiples).
   A `static_assert` failure is an *expected* compile failure for that configuration, not a bug.
 - Static shared memory is used; configurations whose arrays exceed 48 KB fail in `ptxas` and are
   skipped (`docs/TESTING.md` gives the per-file formula). Do not convert files to dynamic smem unless the
   user asks.
 
-## Workflow
+## Workflow (the tasks of `ROADMAP.md`)
 
-1. Fill in the two TODO sections above. Record the commit hash of this repo you are testing.
-2. Build the harness described in `docs/TESTING.md` under `collectives/harness/` (new directory; the
-   algorithm files must stay untouched except for genuine bug fixes).
-3. Run the correctness matrix; then the deadlock/race checks; then the performance sweep from
-   `docs/EXPERIMENTS.md`; then execute the notebook.
-4. If an algorithm file is wrong, fix the smallest thing that makes it correct, keep the algorithm's
+1. C1: record the tooling above, vendor the microbench harness (`../docs/REUSE.md`), build the harness
+   described in `docs/TESTING.md` under `collectives/harness/` (new directory; the algorithm files must stay
+   untouched except for genuine bug fixes), and the compile matrix.
+2. C2–C3: correctness matrix; C4: deadlock/race checks and sanity checks; C5: performance sweep from
+   `docs/EXPERIMENTS.md`; C6: the notebook; C7 (optional): the extensions taken over from microbench 17.
+3. If an algorithm file is wrong, fix the smallest thing that makes it correct, keep the algorithm's
    pattern (rounds, partners, message sizes) unchanged, and log the fix in the *Change log* below with
    the failing configuration and the root cause. Never "fix" a failure by skipping it, loosening a
    tolerance beyond what `docs/TESTING.md` allows, or adding barriers that change the algorithm's
-   round structure without saying so in the docstring.
-5. Report: which files pass which configurations, which were fixed and how, where the results and
-   figures live, and anything that could not be measured and why.
+   round structure without saying so in the docstring. If a fix changes the README traffic model, update
+   `README.md` in the same commit.
+4. Report at the end of every task: which files pass which configurations, which were fixed and how, where
+   the results and figures live, and anything that could not be measured and why.
 
 ## Rules of thumb
 
 - A hung launch cannot be killed from inside the process: run every configuration in a child process
-  with a timeout (see `docs/TESTING.md`) so one deadlock does not take down the sweep.
+  with a timeout (see `docs/TESTING.md`) so one deadlock does not take down the sweep. A hung kernel keeps
+  the GPU busy until its process dies: the driver must kill the child, and the next configuration starts
+  only after the GPU is idle again.
 - Use `%globaltimer`-based latency from the kernel's own stamps for the figures; host-side
-  `cudaEvent` time includes launch overhead and is reported separately.
-- Lock clocks (or use `ncu --clock-control base`) for the performance sweep; note whether you could.
-- Keep raw CSVs under `collectives/results/` (git-ignored except the final summary files you decide to commit).
+  `cudaEvent` time includes launch overhead (≈ 4 µs event floor, 7–8 µs launch on this host) and is
+  reported separately.
+- Clocks: every timed or ncu run uses `tools/run --profile --lock-sm-mhz <LOCK>`; ncu always with
+  `--clock-control none` (never `base`: it would override our lock). Record clocks and throttle reasons per
+  configuration (`hb::Run::clock_note`) and discard launches that ran below the lock (count them).
+- CSVs: mandatory columns first, append-only, flushed per launch, runs registered in
+  `results/collectives__runs.csv` (`../docs/ENVIRONMENT.md` §5).
+- Keep raw CSVs under `collectives/results/` (git-ignored). Commit only the executed notebook and the
+  summary files C6 names (e.g. `results/summary_*.csv`, force-added), never raw stamps.
+- Commit message per task: `collectives/C<n>: <what was done>; <main finding>`.
 
 ## Change log  *(append entries here)*
 

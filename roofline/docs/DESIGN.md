@@ -26,14 +26,17 @@ headline markers are at **operator scope**; end-to-end serving (SGLang/vLLM) is 
 ## 2. Roofline methodology
 
 ### 2.1 Ceilings (measured, datasheet as dashed reference)
-Written to `results/ceilings.csv` (schema §5) by microbenchmarks the agent writes under `harness/`:
+Written to `results/ceilings.csv` (schema §5) by roadmap task R1, with microbenchmarks under
+`harness/ceilings/` (memory kernels vendored from h100-microbench experiment 05, `../../docs/REUSE.md`),
+on GPU 3 at the locked SM clock (`../../docs/ENVIRONMENT.md`). The datasheet references are at boost clock,
+so a measured compute ceiling below them is expected; state both clocks in the notebook.
 
 | Ceiling | Method | Datasheet reference (H100 NVL, per GPU) |
 |---|---|---|
-| HBM bandwidth | STREAM-like copy/triad kernels over ≥ 1 GB, locked clocks; report read, write and copy GB/s | 3.9 TB/s HBM3 |
-| L2 bandwidth | repeated reads of a 16–24 MB working set (fits the 50 MB L2), all SMs | — |
-| L1/SMEM bandwidth | per-SM shared-memory read microbenchmark × SM count (132) | 33 TB/s class |
-| DSMEM bandwidth | `../collectives/` results: aggregate injection bandwidth of `allgather__direct_pull`, `alltoall__direct_push` at N = 2…16, best case, × (132 / N) clusters | — |
+| HBM bandwidth | microbench 05 `bw_dram.cu` `k4` (read / write / copy over 2 GiB, 4 × 132 × 1024 threads, `CleanL2` before each launch), locked clock; report read, write and copy GB/s | 3.9 TB/s HBM3 |
+| L2 bandwidth | microbench 05 `bw_l2.cu` `k3_direct`: repeated reads of a 16–24 MB working set (fits the 60 MiB L2), all SMs | — |
+| L1/SMEM bandwidth | microbench 05 `bw_smem_l1.cu` `k12`: per-SM shared-memory read rate (iteration-slope method) × SM count (132) | 33 TB/s class |
+| DSMEM bandwidth | R1's own aggregate microbenchmark: max active clusters at 1 CTA/SM, CS = 2…16, every CTA streaming from a peer (`ld.shared::cluster.v4` pull and bulk push), best CS and direction, cross-checked with the `dshared` byte counters. Independent of `../collectives/`; its results, when they exist, are an optional cross-check only | — |
 | FP32 CUDA-core peak | FMA-chain kernel, all SMs | 67 TFLOP/s |
 | FP16/BF16 tensor-core peak (dense) | large cuBLAS GEMM (8192³) best of 10 | 989 TFLOP/s dense |
 | FP8 tensor-core peak | DeepGEMM / cuBLASLt FP8 GEMM best of 10 | 1979 TFLOP/s dense |
@@ -51,9 +54,15 @@ L ∈ {HBM, L2, L1/SMEM, DSMEM}.
   `sm__inst_executed_pipe_tensor_op_hmma.sum` × FLOP per instruction for tensor cores. A disagreement
   > 10 % between the formula and the counters must be explained in the notebook.
 - **bytes_HBM** = `dram__bytes_read.sum + dram__bytes_write.sum`; **bytes_L2** = `lts__t_bytes.sum`;
-  **bytes_L1/SMEM** = `l1tex__t_bytes.sum` (+ shared-memory wavefront bytes); **bytes_DSMEM** = the
-  distributed-shared-memory counters identified in `../collectives/docs/EXPERIMENTS.md` §4.
-- **time** = ncu `gpu__time_duration.sum` per kernel with `--clock-control base`, summed over the
+  **bytes_L1/SMEM** = `l1tex__t_bytes.sum` (+ shared-memory wavefront bytes,
+  `l1tex__data_pipe_lsu_wavefronts_mem_shared_op_{ld,st}.sum` × 128 B); **bytes_DSMEM** =
+  `l1tex__m_l1tex2xbar_write_bytes_mem_dshared.sum` (+ `_op_tma_st` for bulk pushes) and
+  `l1tex__m_xbar2l1tex_read_bytes_mem_dshared.sum`; which of the two carries the payload of DSMEM loads is
+  unverified (h100-microbench `docs/context/07` §8) — R1 settles it with its DSMEM microbenchmark and
+  records the rule in §6. TMA-multicast traffic (DAK, DeepGEMM) shows up as
+  `l1tex__m_xbar2l1tex_read_bytes_mem_global_op_tma_ld_dest_multicast.sum`, not as `dshared`. Only rollups
+  exist on this setup (no per-SM instances); one `lts__` counter is collected per replay pass.
+- **time** = ncu `gpu__time_duration.sum` per kernel with `--clock-control none` under the locked clock, summed over the
   kernels of the variant; a separate timed run (locked clocks, L2 flushed, 20 warm-up + 100 reps,
   cudaEvent or `%globaltimer` inside the kernel) gives the p10/p50/p90 used for error bars.
 - **Aggregation over a kernel sequence** (unfused baselines, layer scope): sum work, bytes and kernel
@@ -74,7 +83,9 @@ L ∈ {HBM, L2, L1/SMEM, DSMEM}.
 1. Ceilings first (§2.1), once per session, with the clock state recorded.
 2. Per manifest, per variant, per shape: build (apply `patches/` if referenced), run the validation
    command (outputs must match the reference within the manifest's tolerance), timed run, ncu run.
-   Use `ncu --cache-control all --clock-control base --metrics <list> --csv`; for Python-launched
+   Use `ncu --cache-control all --clock-control none --metrics <list> --csv --page raw --print-units base`
+   inside `tools/run --profile --lock-sm-mhz <LOCK>` (never `--clock-control base`: it overrides the lock;
+   never `--print-metric-name name`: ncu 2025.2.1 rejects it with `--page raw`); for Python-launched
    kernels add `-k regex:<kernel names from the manifest>` and `--launch-skip/--launch-count` to
    capture exactly one iteration of each kernel of the sequence.
 3. Append rows to `results/points.csv` (one row per rep for timing; counters replicated across reps or
@@ -94,6 +105,10 @@ L ∈ {HBM, L2, L1/SMEM, DSMEM}.
    optimized region; speedup.
 
 ## 5. CSV schema
+Every file starts with the mandatory columns `gpu_name, sm_count, sm_clock_mhz, mem_clock_mhz,
+cuda_version, driver_version, run_id, launch_idx` (`../../docs/ENVIRONMENT.md` §5); the notebook reads the
+columns below by name and ignores the others.
+
 `results/ceilings.csv`
 ```
 name,value,unit,method,source
@@ -109,8 +124,11 @@ workload,variant_id,role,scope,shape_id,rep,time_ns,wall_ns,flops,int_ops,hbm_by
 `shape_id` = key of the manifest's `shapes` entry; `rep = -1` for counter-only rows; `source` ∈
 {measured, reported}.
 
-## 6. Tooling  *(to be filled by the remote agent)*
-- Driver / CUDA / nvcc / Nsight Compute / PyTorch / flashinfer / Triton versions: _TODO_
-- Clock state and how it was locked: _TODO_
-- Exact ncu metric names used for each byte level (after `ncu --query-metrics`): _TODO_
-- Build commands actually used per artifact: _TODO_
+## 6. Tooling  *(known values pre-filled; run-time values filled by R0/R1 and each workload task)*
+- Base image: h100-microbench `h100-microbench:cuda12.9.1-<hash>` (CUDA 12.9.1, nvcc 12.9.86, Nsight
+  Compute 2025.2.1, Nsight Systems, Python 3.12); roofline image tag and Dockerfile: `roofline/docker/` (R0).
+- Driver / PyTorch / flashinfer / Triton versions: _TODO (R0)_
+- Clock state: SM clock locked by `tools/run --profile --lock-sm-mhz <LOCK>` on GPU 3 (value from
+  h100-microbench `docs/context/10` §2), memory clock 2619 MHz, never changed. Value used: _TODO (R1)_
+- Exact ncu metric names used for each byte level (after `ncu --query-metrics`) and the DSMEM payload rule: _TODO (R1)_
+- Build commands actually used per artifact: _TODO (R2–R7, one line per artifact)_
