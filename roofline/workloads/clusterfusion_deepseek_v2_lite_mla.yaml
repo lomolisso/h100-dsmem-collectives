@@ -1,0 +1,39 @@
+name: clusterfusion_deepseek_v2_lite_mla
+paper: ClusterFusion (NeurIPS 2025), Appendix B.1
+model: DeepSeek-V2-Lite single-token decode, fp16, fused MLA attention block (weight-absorbed)
+runnable: true
+precision: fp16_tensor
+scope_operator:
+  description: RMSNorm + Q/KV down-projections + RoPE + latent RMSNorm + W_UK absorb + MQA flash-decoding over the latent cache + W_UV + O-proj, 16 heads
+  shapes:
+    s4k: {hidden: 2048, heads: 16, nope: 128, rope: 64, lora: 512, seq_len: 4096}
+  flops: "2*hidden*(heads*nope + heads*rope + lora + rope) + 2*heads*nope*lora + 4*seq_len*heads*(lora + rope) + 2*heads*lora*nope + 2*heads*nope*hidden"
+  min_hbm_bytes: "2*(hidden*(heads*nope + heads*rope + lora + rope) + heads*nope*lora + heads*lora*nope + heads*nope*hidden) + 2*seq_len*(lora + rope)"
+  validate: {reference: "torch fp32 reference to be written by the agent (no test exists in the repo)", tolerance: "max abs 5e-2 fp16"}
+  variants:
+    - id: unfused
+      role: non_dsmem
+      description: unfused torch/flashinfer sequence (to be written; MQA decode via flashinfer with head_dim 576)
+      build: {cwd: third_party/ClusterFusion, cmd: "pip install -e ."}
+      run:   {cwd: third_party/ClusterFusion, cmd: "agent script"}
+      kernels: [".*"]
+      cluster_size: null
+    - id: fused_c1
+      role: control
+      description: fused kernel rebuilt with CLUSTER_SIZE 1 in include/H100/deepseek/config.h
+      build: {cwd: third_party/ClusterFusion, cmd: "git apply ../../roofline/patches/clusterfusion__deepseek_cluster_size_1.patch && pip install -e .", patch: patches/clusterfusion__deepseek_cluster_size_1.patch}
+      run:   {cwd: third_party/ClusterFusion, cmd: "python -c 'import clusterfusion; clusterfusion.deepseek_decoder_layer(...)' # agent script"}
+      kernels: ["DeepSeekDecoderLayerKernel"]
+      cluster_size: 1
+    - id: fused_c4
+      role: dsmem
+      description: shipped fused MLA kernel, cluster 4 per head, DSMEM AllReduce + AllGather
+      build: {cwd: third_party/ClusterFusion, cmd: "pip install -e ."}
+      run:   {cwd: third_party/ClusterFusion, cmd: "python -c 'import clusterfusion; clusterfusion.deepseek_decoder_layer(...)' # agent script"}
+      kernels: ["DeepSeekDecoderLayerKernel"]
+      cluster_size: 4
+scope_layer: null
+measure: {reps: 100, warmup: 20, flush_l2: true}
+notes: >
+  SEQ_LEN is compile-time (4096). No Python test or reference exists; lowest ClusterFusion priority.
+  The fused kernel ends with global atomicAdd across heads for the O-projection in both variants.

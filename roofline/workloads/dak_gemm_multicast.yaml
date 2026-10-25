@@ -1,0 +1,42 @@
+name: dak_gemm_multicast
+paper: DAK (arXiv 2604.26074)
+model: OPT / Llama linear layer, fp16, C[tokens, M] = X[tokens, K] . W[K, M]
+runnable: true
+precision: fp16_tensor
+scope_operator:
+  description: tiled fp16 GEMM (WGMMA 64x256x16), weight tiles delivered by TMA multicast to a 2-CTA cluster
+  shapes:
+    t512:  {tokens: 512,  m: 4096, k: 4096}
+    t1024: {tokens: 1024, m: 4096, k: 4096}
+    t512_opt30b: {tokens: 512, m: 7168, k: 7168}
+  flops: "2*tokens*m*k"
+  min_hbm_bytes: "2*(m*k + tokens*k + tokens*m)"
+  validate: {reference: "torch nn.Linear (MAPE printed by benchmark_linear.py)", tolerance: "MAPE < 1e-2"}
+  variants:
+    - id: multicast_prefill
+      role: non_dsmem
+      description: gemv_multicast_prefill - identical tiles/smem/warp roles/MMA atom, plain per-CTA TMA loads (what benchmark_linear.py --type multicast runs by default, prefill=True)
+      build: {cwd: third_party/DirectAccessKernel, cmd: "bash setup.sh && make pyext arch=90a"}
+      run:   {cwd: third_party/DirectAccessKernel, cmd: "python benchmark/benchmark_linear.py --type multicast --offload 0 --m {m} --k {k} --n {tokens} --graph"}
+      kernels: ["gemv_multicast_prefill"]
+      cluster_size: 1
+    - id: multicast
+      role: dsmem
+      description: gemv_multicast - cluster 2, rank 0 TMA-multicasts each 8 KB weight tile into both CTAs, remote mbarrier arrive back-pressure
+      build: {cwd: third_party/DirectAccessKernel, cmd: "bash setup.sh && make pyext arch=90a"}
+      run:   {cwd: third_party/DirectAccessKernel, cmd: "python benchmark/benchmark_linear.py --type multicast --offload 0 --m {m} --k {k} --n {tokens} --graph  # with LinearMulticast.prefill=False and num_copy_blocks=132 (agent patch or script)"}
+      kernels: ["gemv_multicast"]
+      cluster_size: 2
+    - id: cublas
+      role: control
+      description: cuBLAS nn.Linear (--type vanila), reference throughput
+      build: {cwd: third_party/DirectAccessKernel, cmd: "bash setup.sh"}
+      run:   {cwd: third_party/DirectAccessKernel, cmd: "python benchmark/benchmark_linear.py --type vanila --m {m} --k {k} --n {tokens}"}
+      kernels: ["gemm|cutlass|sm90"]
+      cluster_size: null
+scope_layer: null
+measure: {reps: 100, warmup: 20, flush_l2: true}
+notes: >
+  Run with --offload 0 (all weights in HBM; host-offload paths target GH200 NVLink-C2C). tokens must be a
+  multiple of 512 so both CTAs of a cluster share a weight tile; pass num_copy_blocks=132 (NUM_SMS is
+  hard-coded to 132 in config.cuh, matching H100 NVL). gemv (gemv.cuh) is a different tiling, optional extra marker.

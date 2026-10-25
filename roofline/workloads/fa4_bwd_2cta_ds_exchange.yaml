@@ -1,0 +1,37 @@
+name: fa4_bwd_2cta_ds_exchange
+paper: FlashAttention-4 (arXiv 2603.05451)
+model: attention backward pass, bf16, head dim 128, causal and non-causal (B200, sm_100 only)
+runnable: false
+precision: bf16_tensor
+scope_operator:
+  description: 5-MMA backward per (KV block, Q block); 2-CTA mode exchanges half of dS over DSMEM and halves dQ atomics
+  shapes:
+    s16k_causal: {seqlen: 16384, heads: 16, head_dim: 128, batch: 2, causal: 1}
+    s16k_full:   {seqlen: 16384, heads: 16, head_dim: 128, batch: 2, causal: 0}
+  flops: "2.5 * 4 * seqlen*seqlen * head_dim * heads * batch / (2 if causal else 1)"
+  min_hbm_bytes: "2 * batch*heads*seqlen*head_dim * 9"
+  validate: {reference: "n/a (reported)", tolerance: "n/a"}
+  variants:
+    - id: one_cta
+      role: non_dsmem
+      description: 1-CTA backward (use_2cta_instrs=False), dS kept in TMEM, full dQ atomics
+      build: {cwd: third_party/flash-attention, cmd: "n/a on H100"}
+      run:   {cwd: third_party/flash-attention, cmd: "n/a on H100"}
+      kernels: ["flash_bwd_sm100"]
+      cluster_size: 1
+    - id: two_cta
+      role: dsmem
+      description: 2-CTA backward, cp.async.bulk DSMEM exchange of half of dS (16 KB) per iteration
+      build: {cwd: third_party/flash-attention, cmd: "n/a on H100"}
+      run:   {cwd: third_party/flash-attention, cmd: "n/a on H100"}
+      kernels: ["flash_bwd_sm100"]
+      cluster_size: 2
+scope_layer: null
+measure: null
+reported:
+  two_cta: {throughput: null, flops: null, hbm_bytes: null, source: "FA4 paper Fig. 6 (backward TFLOPS, B200, hd 128) - fill the deterministic/non-deterministic 2-CTA bars at seqlen 16384; traffic model Table 3 (2688 smem cycles)"}
+  one_cta: {throughput: null, flops: null, hbm_bytes: null, source: "FA4 paper Fig. 7 1-CTA deterministic bars; Table 3 (3328 smem cycles)"}
+notes: >
+  Blackwell-only (tcgen05, TMEM, cta_group::2). Plotted as 'reported (B200)' stars from the paper's numbers,
+  clearly separated from H100 measurements; the agent fills `reported` from the PDF (hollow if only
+  relative numbers are available).

@@ -1,0 +1,42 @@
+name: hpcops_topk_cluster8
+paper: Tencent hpc-ops (filtered top-k for LLM sampling)
+model: exact top-2048 index selection over a row of fp32 logits (radix select)
+runnable: true
+precision: int32
+scope_operator:
+  description: coarse 2048-bin histogram, prefix-sum threshold, classify pass, candidate refinement; one row of n logits
+  shapes:
+    m8_n32k:  {m: 8,  n: 32768,  k: 2048}
+    m16_n64k: {m: 16, n: 65536,  k: 2048}
+    m8_n240k: {m: 8,  n: 244650, k: 2048}
+  int_ops: "m*n*8 + m*k*16"
+  min_hbm_bytes: "m*n*4*2 + m*k*4"
+  validate: {reference: "torch.topk indices (set equality per row), tests/test_topk.py", tolerance: "exact set"}
+  variants:
+    - id: kv_split_global
+      role: non_dsmem
+      description: row-local single-CTA kernel (n <= 131072) or KV-split kernel with global workspace, obtained by padding the row capacity to 17 rows with num_valid_rows = m
+      build: {cwd: third_party/hpc-ops, cmd: "make sm90 && pip install dist/*.whl"}
+      run:   {cwd: third_party/hpc-ops, cmd: "python - <<'EOF' # hpc.topk(logits[17,{n}], ke[17], out, num_valid_rows=[{m}], top_k=2048)"}
+      kernels: ["topk_filtered_row_local|topk_filtered_split_kernel"]
+      cluster_size: 1
+    - id: kv_split8_patched
+      role: control
+      description: exact 8-way KV-split analogue through global memory, via patches/hpcops_topk__use_cluster_false.patch (use_cluster = false)
+      build: {cwd: third_party/hpc-ops, cmd: "git apply ../../roofline/patches/hpcops_topk__use_cluster_false.patch && make sm90 && pip install dist/*.whl", patch: patches/hpcops_topk__use_cluster_false.patch}
+      run:   {cwd: third_party/hpc-ops, cmd: "python - <<'EOF' # hpc.topk(logits[{m},{n}], ke[{m}], out, num_valid_rows=[{m}], top_k=2048)"}
+      kernels: ["topk_filtered_split_kernel"]
+      cluster_size: 1
+    - id: cluster8
+      role: dsmem
+      description: topk_filtered_cluster8_exact_kernel - 8 CTAs per row, DSMEM histogram AllReduce (pull reduce-scatter + push all-gather) and rooted gather to rank 0
+      build: {cwd: third_party/hpc-ops, cmd: "make sm90 && pip install dist/*.whl"}
+      run:   {cwd: third_party/hpc-ops, cmd: "python - <<'EOF' # hpc.topk(logits[{m},{n}], ke[{m}], out, num_valid_rows=[{m}], top_k=2048)"}
+      kernels: ["topk_filtered_cluster8_exact_kernel"]
+      cluster_size: 8
+scope_layer: null
+measure: {reps: 100, warmup: 20, flush_l2: true}
+notes: >
+  Work is integer ops (int_ops; the formula is a model - replace by ncu sm__inst_executed counts) plotted
+  against the INT32 ceiling. Dispatch (choose_topk2048_plan, topk_filtered.cu:2860-2894) picks cluster8 for
+  m<=8 & n>=32768 or m<=16 & n>=65536; no flag exists to turn it off. Requires CUDA 12.9+, C++20.

@@ -1,0 +1,31 @@
+# Copy to <name>.yaml. Field reference: ../docs/ADDING_A_WORKLOAD.md. Files starting with '_' are ignored.
+name: my_workload
+paper: <paper or origin>
+model: <model / application>
+runnable: true
+precision: fp16_tensor            # fp16_tensor | bf16_tensor | fp8_tensor | fp32_cuda | int32
+scope_operator:
+  description: <region the DSMEM port changes>
+  shapes:
+    s0: {m: 4096, n: 4096, k: 4096}
+  flops: "2*m*n*k"
+  min_hbm_bytes: "2*(m*k + k*n + m*n)"
+  validate: {reference: <torch reference>, tolerance: "rel 1e-2"}
+  variants:
+    - id: baseline
+      role: non_dsmem
+      description: <unfused kernels or cluster size 1>
+      build: {cwd: third_party/<repo>, cmd: "<build>"}
+      run:   {cwd: third_party/<repo>, cmd: "<one iteration on {shape}>"}
+      kernels: ["<ncu -k regex>"]
+      cluster_size: 1
+    - id: dsmem
+      role: dsmem
+      description: <DSMEM / multicast version>
+      build: {cwd: third_party/<repo>, cmd: "<build>"}
+      run:   {cwd: third_party/<repo>, cmd: "<one iteration on {shape}>"}
+      kernels: ["<ncu -k regex>"]
+      cluster_size: 4
+scope_layer: null
+measure: {reps: 100, warmup: 20, flush_l2: true}
+notes: ""

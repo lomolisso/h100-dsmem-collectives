@@ -1,0 +1,43 @@
+name: credit_pearson_backward
+paper: CREDIT (arXiv 2609.01864)
+model: Pearson-correlation backward dx, dy, fp32 row-wise reduction-reuse workload
+runnable: true
+precision: fp32_cuda
+scope_operator:
+  description: Pearson-correlation backward dx, dy over rows x cols; reduction statistics shared across the CTAs of a row
+  shapes:
+    n4k:  {rows: 4096, cols: 4096}
+    n16k: {rows: 4096, cols: 16384}
+    n64k: {rows: 4096, cols: 65536}
+  flops: "rows*cols*16"
+  min_hbm_bytes: "rows*cols*4*6"
+  validate: {reference: "host double-precision reference inside the binary (omit --no-verify)", tolerance: "binary's own check"}
+  variants:
+    - id: block_read
+      role: non_dsmem
+      description: block_bwd_read_kernel - one CTA per row, re-reads the row from global memory per reduction pass
+      build: {cwd: third_party/CREDIT, cmd: "make all CUDA_ARCH=sm_90a"}
+      run:   {cwd: third_party/CREDIT, cmd: "./build/pearson_backward --csv --rows {rows} --n-values {cols} --warmup 20 --iters 100 --profile-variant block"}
+      kernels: ["block_bwd_read_kernel"]
+      cluster_size: 1
+    - id: block_smem
+      role: control
+      description: block_bwd_staged_kernel - one CTA stages the whole row in smem (only when it fits; binary reports whichever block variant is faster, so read block_name)
+      build: {cwd: third_party/CREDIT, cmd: "make all CUDA_ARCH=sm_90a"}
+      run:   {cwd: third_party/CREDIT, cmd: "./build/pearson_backward --csv --rows {rows} --n-values {cols} --warmup 20 --iters 100 --profile-variant block"}
+      kernels: ["block_bwd_staged_kernel"]
+      cluster_size: 1
+    - id: cluster_smem
+      role: dsmem
+      description: cluster_bwd_staged_kernel - P CTAs per row, replicated-push DSMEM AllReduce of the row statistics (best P of 2/4/8 per shape)
+      build: {cwd: third_party/CREDIT, cmd: "make all CUDA_ARCH=sm_90a"}
+      run:   {cwd: third_party/CREDIT, cmd: "./build/pearson_backward --csv --rows {rows} --n-values {cols} --warmup 20 --iters 100 --cluster-size {P} --profile-variant cluster"}
+      kernels: ["cluster_bwd_staged_kernel"]
+      cluster_size: [2, 4, 8]
+scope_layer: null
+measure: {reps: 100, warmup: 20, flush_l2: true}
+notes: >
+  The binary's timing loop does not flush L2 (back-to-back launches between two events): take ncu
+  counters with --cache-control all and add a 256 MB flush in a wrapper for timed runs, or state warm-L2.
+  Modeled bytes per element in the binary are the compulsory traffic (min_hbm_bytes above).
+  Triton / torch.compile points are optional extras via scripts/run_local.py.

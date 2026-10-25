@@ -1,0 +1,30 @@
+diff --git a/csrc/jit_kernels/heuristics/sm90.hpp b/csrc/jit_kernels/heuristics/sm90.hpp
+index 144bfd1..b25eda1 100644
+--- a/csrc/jit_kernels/heuristics/sm90.hpp
++++ b/csrc/jit_kernels/heuristics/sm90.hpp
+@@ -1,5 +1,8 @@
+ #pragma once
+ 
++#include <cstdlib>
++#include <string>
++
+ #include <cute/arch/mma_sm100_desc.hpp>
+ // Reuse some types in the JIT modules
+ #include <deep_gemm/common/types.cuh>
+@@ -66,10 +69,14 @@ struct SM90ArchSpec {
+             // Not supported
+             (desc.gemm_type == GemmType::Batched);
+ 
++        // roofline non-DSMEM variant: DG_FORCE_CLUSTER_1=1 restricts the candidates to cluster size 1 (no TMA multicast)
++        const bool force_cluster_1 = std::getenv("DG_FORCE_CLUSTER_1") != nullptr and std::string(std::getenv("DG_FORCE_CLUSTER_1")) == "1";
++        const int max_cluster = (disable_multicast or force_cluster_1) ? 1 : 2;
++
+         // Enumerate all candidates
+         std::vector<Layout> candidates;
+-        for (int cluster_m = 1; cluster_m <= (disable_multicast ? 1 : 2); ++ cluster_m) {
+-            for (int cluster_n = 1; cluster_n <= (disable_multicast ? 1 : 2); ++ cluster_n) {
++        for (int cluster_m = 1; cluster_m <= max_cluster; ++ cluster_m) {
++            for (int cluster_n = 1; cluster_n <= max_cluster; ++ cluster_n) {
+                 // We only support cluster 2
+                 if (cluster_m * cluster_n > 2)
+                     continue;
