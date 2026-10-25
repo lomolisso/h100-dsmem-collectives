@@ -32,6 +32,11 @@ Expected compile failures (record them as `SKIP:static_assert` / `SKIP:smem`, ne
   allreduce files: 2M (one-shot/atomic/replicated: 2M–3M, slots N·M), ring: M + M/N, rabenseifner/recursive
   doubling/shift: 3M; allgather: N·M (+M); reducescatter: N·M + M (recursive halving: 1.5·N·M; direct push: 2·N·M);
   alltoall: 2·N·M (Bruck: 1.5·N·M). Compute the limit from `ptxas -v` output rather than trusting these figures.
+  Measured by C1 (`ptxas -v`, `results/build_matrix.csv`): the figures hold except `allreduce__rabenseifner__mpich`
+  = 1.5·M (never over the limit in this matrix) and `allreduce__2d_mesh__generic` = 2.5/3.5/2.75/3.25·M for
+  N = 2/4/8/16 (over the limit at M = 4096 for N = 4 and 16). The limit is inclusive: exactly 49 152 B compiles
+  (e.g. `allgather__direct_pull__generic` N = 2, M = 4096). Extra `static_assert`: `allreduce__shift_accumulate_atomic__clusterfusion`
+  requires M ≤ 1024 (one element per thread), so its M = 4096 configurations are `SKIP:static_assert`.
 
 ## 2. Host harness (`harness/main.cu`)
 

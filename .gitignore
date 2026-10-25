@@ -10,3 +10,6 @@ collectives/build/
 collectives/results/
 roofline/results/
 roofline/build/
+
+# Python bytecode
+__pycache__/

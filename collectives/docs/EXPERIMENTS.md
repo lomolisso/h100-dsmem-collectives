@@ -12,18 +12,36 @@ ncu rules: `../../docs/ENVIRONMENT.md`.
   h100-microbench `docs/context/10` §2), memory clock 2619 MHz never changed; the harness logs clocks and
   throttle reasons per configuration (`results/collectives__clock_log.csv`). Value used: _TODO (C5)_
 - Exact commands used for the sweep and for `ncu`: _TODO (C5)_
-- DSMEM metric names (candidates verified for gh100 by h100-microbench `docs/context/07` §2; confirm with
-  `ncu --query-metrics` in C1 and record the final list here): outbound link bytes
-  `l1tex__m_l1tex2xbar_write_bytes_mem_dshared.sum` (+ `_op_st`, `_op_atom`, `_op_redas`, and
-  `l1tex__m_l1tex2xbar_write_bytes_mem_dshared_op_tma_st.sum` for bulk pushes), inbound
-  `l1tex__m_xbar2l1tex_read_bytes_mem_dshared.sum` (+ `_op_…`), request side
-  `l1tex__t_{requests,sectors,bytes}_pipe_lsu_mem_dshared(_op_{ld,st,atom,redas}).sum`, instruction counts
-  `sm__sass_inst_executed_op_dshared_{ld,st,atom,redas,stas,tma_st,tma_red}.sum`, link utilisation
-  `l1tex__m_{l1tex2xbar,xbar2l1tex}_throughput_pipe_lsu_mem_dshared.avg.pct_of_peak_sustained_elapsed`,
-  cluster `launch__cluster_*`, `gpc__cgas_launched.sum`. ⚠ Unverified on the device (microbench `07` §8):
-  which side carries the payload of a DSMEM *load* (request vs response bytes), the meaning of `loopback`,
-  and the rated link peak — C1 settles the first two with one push and one pull configuration of known
-  traffic. Final list: _TODO (C1)_
+- DSMEM metric names — **final list (C1, 2026-10-25, `ncu --query-metrics` on GPU 3, ncu 2025.2.1; script
+  `harness/ncu_discovery.sh`, raw output `results/ncu_query_metrics.txt` and `results/ncu_discovery__*.csv`, local)**.
+  All are listed and were collected with `--clock-control none --cache-control all --csv --page raw --print-units base`:
+  - link bytes: `l1tex__m_l1tex2xbar_write_bytes_mem_dshared.sum` and `l1tex__m_xbar2l1tex_read_bytes_mem_dshared.sum`,
+    each with the per-operation suffixes `_op_{ld,st,atom,redas,tma_st,tma_red}`;
+  - LSU request side (generic-proxy `ld/st/atom/red` only, **not** bulk copies): `l1tex__t_{requests,sectors,bytes}_pipe_lsu_mem_dshared(_op_{ld,st}).sum`;
+  - instructions: `sm__sass_inst_executed_op_dshared_{ld,st,atom,redas,stas,tma_st,tma_red}.sum`;
+  - link utilisation: `l1tex__m_{l1tex2xbar,xbar2l1tex}_throughput_pipe_lsu_mem_dshared.avg.pct_of_peak_sustained_elapsed`;
+  - placement/launch: `gpc__cgas_launched.sum`, `sm__ctas_launched.sum`, `sm__cycles_elapsed.avg`; the `launch__cluster_*`
+    values are launch attributes (not in `--query-metrics`) and are reported in every ncu CSV anyway.
+  **Payload accounting, settled on the device** (N = 4, M = 256 float, one launch each; known payload (N−1)·M·4 B per
+  CTA = 12 288 B kernel-wide):
+
+  | Configuration | primitive | `l1tex2xbar_write_bytes_mem_dshared.sum` | `xbar2l1tex_read_bytes_mem_dshared.sum` | op suffix carrying it | instructions |
+  |---|---|---|---|---|---|
+  | `alltoall__direct_push__generic` | `cp.async.bulk` push | 12 288 | 12 288 | `_op_tma_st` (both) | `op_dshared_tma_st` 12 = N(N−1) copies |
+  | `allgather__direct_replicated_push__credit` | plain remote `st` | 12 288 | 12 288 | `_op_st` (both) | `op_dshared_st` 96 (warp-level, 128 B each) |
+  | `allgather__direct_pull__generic` | `ld.shared::cluster.v4` pull | 12 288 | 12 288 | `_op_ld` (both) | `op_dshared_ld` 24 (512 B each) |
+  | all-exit baseline (same grid/cluster) | — | 0 | 0 | — | 0 |
+
+  ⇒ For pushes and pulls alike, **each payload byte is counted exactly once in the outbound
+  (`l1tex2xbar_write`) and once in the inbound (`xbar2l1tex_read`) kernel-wide sum**; request/address traffic of a
+  pull adds nothing to either. Use `l1tex__m_l1tex2xbar_write_bytes_mem_dshared.sum` (= `xbar2l1tex_read…`) as the
+  measured DSMEM payload and compare it with N × the per-CTA model; the `_op_*` split identifies the primitive.
+  Kernel-wide sums cannot say which SM sent/received (no per-instance values). The baseline adds 0 DSMEM bytes.
+  `l1tex__t_*_pipe_lsu_mem_dshared` misses bulk copies (0 for the bulk push), so it is not a payload metric.
+  `lts__t_sectors_srcunit_tex.sum` is **not ≈ 0** for a collective: it counts the kernel's own global `in`/`out`/stamp
+  traffic (656 sectors for the two all-gathers ≈ 4 KiB in + 16 KiB out; 1040 for the all-to-all ≈ 16 + 16 KiB),
+  and 0 for the baseline; the C4 check "DSMEM never reaches L2" must compare it with that global-I/O model, not with 0.
+  `loopback` semantics and the rated link peak remain unverified.
 
 ## 2. Definitions
 

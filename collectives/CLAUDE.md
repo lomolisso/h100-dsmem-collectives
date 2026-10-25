@@ -41,11 +41,25 @@ Follow `../CLAUDE.md` ("Starting a new conversation"): the task is the first row
 
 ## Tooling (fill the run-time values when they are first used)
 
-- Image: the h100-microbench image (`h100-microbench:cuda12.9.1-<hash>`): CUDA 12.9.1, nvcc 12.9.86,
-  Nsight Compute 2025.2.1, Nsight Systems, compute-sanitizer, cuda-gdb, Python 3.12 (numpy, pandas,
-  matplotlib, scipy, jupyter). Record `tools/env verify --gpu 3 --profile` output once: _TODO (C1)_
-- Driver / exact image tag / commit of this repo and of the vendored harness (`common/h100mb/PROVENANCE.md`): _TODO (C1)_
-- Exact build and run commands used: _TODO (C1, then each task appends its own)_
+- Image: `h100-microbench:cuda12.9.1-26d4f436f8c5` (`tools/env info`, 2026-10-25): CUDA 12.9.1, nvcc 12.9.86
+  (`Build cuda_12.9.r12.9/compiler.36037853_0`), Nsight Compute 2025.2.1.0 (build 35987062), Nsight Systems
+  2025.1.3.140, compute-sanitizer, cuda-gdb, Python 3.12.3 (numpy 2.5.4, pandas 3.1.0, matplotlib, scipy, jupyter).
+  `tools/env verify --gpu 3 --profile` (2026-10-25): toolchain ok; GPU probe ok (1 visible device, driver API 13000,
+  runtime 12090, H100 NVL cc 9.0, 132 SMs, 60 MiB L2, 227 KiB opt-in smem/block, PCI da:00); one-metric ncu probe ok.
+- Driver 580.126.20 (CUDA 13.0 driver API); GPU 3 = `GPU-1241dcbc-33ea-80bf-5f87-37f7868c3126`, serial
+  1793225008254. SM clock lock **1635 MHz** (confirmed for GPU 3 by the microbench GPU-3 bring-up, commit `89ff996`).
+  Repo commit at C1 start: `bb9fa9c`. Vendored harness: `common/h100mb/` from microbench `14875a5`
+  (`common/h100mb/PROVENANCE.md`).
+- Exact build and run commands (C1; run from the repo root, `TR=~/work/fa2026/iacoma/h100-microbench/tools/run`):
+  - build matrix: `$TR --no-gpu -- python3 collectives/harness/driver.py build --jobs 16` (per configuration the
+    TESTING §1 command plus `-DCOLL_NAME='"<file>"' -DCOLL_OP=<0..3>`; see the driver docstring);
+    status matrix: `python3 collectives/harness/driver.py summary`.
+  - CS-16 launch check and vendored-harness self-test (no clock lock):
+    `$TR -- bash -c './build/trap_cs16; ./build/harness_selftest'` from `collectives/` (binaries built with
+    `nvcc -arch=sm_90a -std=c++17 -O3 -lineinfo -Xptxas -v -I ../common/h100mb -o build/trap_cs16 harness/trap_cs16.cu -L/usr/local/cuda/lib64/stubs -lcuda -lnvidia-ml`,
+    and, from the repo root, `nvcc -arch=sm_90a -O3 -lineinfo -std=c++17 -I common/h100mb -o collectives/build/harness_selftest <MB>/experiments/01__timers_and_harness/src/harness_selftest.cu -L/usr/local/cuda/lib64/stubs -lcuda -lnvidia-ml`).
+  - GPU smoke: `$TR --profile --lock-sm-mhz 1635 -- python3 collectives/harness/driver.py run --smoke --mode correctness --pattern A --reps 5 --processes 1 --child-timeout 120`.
+  - ncu discovery: `$TR --profile --lock-sm-mhz 1635 -- bash collectives/harness/ncu_discovery.sh`.
 
 ## File contract (what the harness may rely on)
 

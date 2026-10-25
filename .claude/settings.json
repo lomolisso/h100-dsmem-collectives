@@ -1,0 +1,48 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(make:*)",
+      "Bash(nvcc:*)",
+      "Bash(ptxas:*)",
+      "Bash(cuobjdump:*)",
+      "Bash(nvdisasm:*)",
+      "Bash(ncu:*)",
+      "Bash(nsys:*)",
+      "Bash(nvidia-smi:*)",
+      "Bash(python3:*)",
+      "Bash(jupyter:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(ls:*)",
+      "Bash(cat:*)",
+      "Bash(head:*)",
+      "Bash(tail:*)",
+      "Bash(wc:*)",
+      "Bash(grep:*)",
+      "Bash(find:*)",
+      "Bash(mkdir:*)",
+      "Bash(/home/rid2/work/fa2026/iacoma/h100-microbench/tools/run:*)",
+      "Bash(roofline/tools/run:*)",
+      "Bash(/home/rid2/work/fa2026/iacoma/h100-microbench/tools/gpu:*)",
+      "Bash(/home/rid2/work/fa2026/iacoma/h100-microbench/tools/env:*)",
+      "Bash(/home/rid2/work/fa2026/iacoma/h100-microbench/tools/clocktest/select_clock.sh:*)"
+    ],
+    "deny": [
+      "Bash(rm -rf /:*)",
+      "Bash(git push --force:*)",
+      "Bash(git push -f:*)",
+      "Bash(docker run:*)",
+      "Bash(docker system prune:*)",
+      "Bash(docker image prune:*)",
+      "Bash(docker container prune:*)",
+      "Bash(docker volume prune:*)",
+      "Bash(docker builder prune:*)"
+    ]
+  },
+  "worktree": {
+    "bgIsolation": "none"
+  }
+}
