@@ -1,0 +1,20 @@
+[submodule "third_party/ClusterFusion"]
+	path = third_party/ClusterFusion
+	url = https://github.com/xinhao-luo/ClusterFusion.git
+[submodule "third_party/CREDIT"]
+	path = third_party/CREDIT
+	url = https://github.com/zhengxiongli08/CREDIT.git
+[submodule "third_party/DirectAccessKernel"]
+	path = third_party/DirectAccessKernel
+	url = https://github.com/shouxulin/DirectAccessKernel.git
+[submodule "third_party/DeepGEMM"]
+	path = third_party/DeepGEMM
+	url = https://github.com/deepseek-ai/DeepGEMM.git
+[submodule "third_party/hpc-ops"]
+	path = third_party/hpc-ops
+	url = https://github.com/Tencent/hpc-ops.git
+	shallow = true
+[submodule "third_party/flash-attention"]
+	path = third_party/flash-attention
+	url = https://github.com/Dao-AILab/flash-attention.git
+	shallow = true
