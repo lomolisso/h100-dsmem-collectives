@@ -1,0 +1,46 @@
+name: clusterfusion_llama2_7b_decoder
+paper: ClusterFusion (NeurIPS 2025)
+model: Llama-2-7B single-token decode, fp16, one decoder layer's attention block
+runnable: true
+precision: fp16_tensor
+scope_operator:
+  description: RMSNorm + QKV GEMV + RoPE + flash-decoding over the KV cache + O-projection, all 32 heads
+  shapes:
+    s1k:  {hidden: 4096, heads: 32, head_dim: 128, seq_len: 1024}
+    s4k:  {hidden: 4096, heads: 32, head_dim: 128, seq_len: 4096}
+    s16k: {hidden: 4096, heads: 32, head_dim: 128, seq_len: 16384}
+  flops: "2*hidden*3*hidden + 4*seq_len*heads*head_dim + 2*hidden*hidden + 4*hidden"
+  min_hbm_bytes: "2*(3*hidden*hidden + hidden*hidden) + 2*2*seq_len*hidden + 2*4*hidden"
+  validate: {reference: "tests/test_llama.py::llama_decode (flashinfer + torch) attention output", tolerance: "max abs 2e-2 fp16, MAE 1e-3"}
+  variants:
+    - id: unfused
+      role: non_dsmem
+      description: unfused sequence flashinfer.fused_add_rmsnorm -> nn.Linear QKV -> torch NEOX RoPE -> flashinfer.single_decode_with_kv_cache -> nn.Linear O-proj
+      build: {cwd: third_party/ClusterFusion, cmd: "pip install flashinfer-python; pip install -e ."}
+      run:   {cwd: third_party/ClusterFusion, cmd: "python -c 'from tests.test_llama import llama_decode' # agent wraps llama_decode for seq_len={seq_len}"}
+      kernels: ["rmsnorm|RMSNorm", "gemv|gemm|cutlass|cublas", "rotary|rope", "SingleDecode|decode", ".*"]
+      cluster_size: null
+    - id: fused_c1
+      role: control
+      description: same fused kernel rebuilt with CLUSTER_SIZE 1 (fusion without DSMEM; one CTA per head)
+      build: {cwd: third_party/ClusterFusion, cmd: "git apply ../../roofline/patches/clusterfusion__cluster_size_1.patch && pip install -e .", patch: patches/clusterfusion__cluster_size_1.patch}
+      run:   {cwd: third_party/ClusterFusion, cmd: "python -c 'import clusterfusion; clusterfusion.llama_decoder_layer_sglang(...)' # agent script, seq_len={seq_len}"}
+      kernels: ["LlamaDecoderLayerKernel"]
+      cluster_size: 1
+    - id: fused_c4
+      role: dsmem
+      description: shipped fused kernel, cluster of 4 CTAs per head, DSMEM AllReduce (bulk push + remote atomics)
+      build: {cwd: third_party/ClusterFusion, cmd: "pip install -e ."}
+      run:   {cwd: third_party/ClusterFusion, cmd: "python -c 'import clusterfusion; clusterfusion.llama_decoder_layer_sglang(...)' # agent script, seq_len={seq_len}"}
+      kernels: ["LlamaDecoderLayerKernel"]
+      cluster_size: 4
+scope_layer:
+  description: full decoder layer = operator region + FFN (gate/up 4096->11008, SiLU, down 11008->4096) + residual adds + second RMSNorm
+  extra_kernels: ["nn.Linear gate/up/down (cuBLAS GEMV)", "silu_and_mul", "fused_add_rmsnorm"]
+  run: {cwd: third_party/ClusterFusion, cmd: "chat/llama/model.py TransformerBlock forward pieces, same inputs; agent script"}
+measure: {reps: 100, warmup: 20, flush_l2: true}
+notes: >
+  Dispatchers call cudaDeviceSynchronize and re-encode TMA maps per call: time with ncu/nsys only.
+  Only cluster sizes 1 and 4 are correct in the shipped reduce loop. kernel_sglang.cuh updates `residual`
+  in place from every head cluster; validate the attention output, not residual. The TileLang port
+  (tilelang_llama.py, cluster_size=1) is an optional extra control, marked untested by the authors.

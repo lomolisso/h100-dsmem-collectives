@@ -1,0 +1,30 @@
+name: clusterfusion_rmsnorm
+paper: ClusterFusion (NeurIPS 2025), norm kernel
+model: RMSNorm over 64 rows x 8192 (compile-time), fp16
+runnable: true
+precision: fp32_cuda
+scope_operator:
+  description: y = x * rsqrt(mean(x^2) + eps) * w per row
+  shapes:
+    s0: {rows: 64, hidden: 8192}
+  flops: "rows*hidden*4"
+  min_hbm_bytes: "2*(2*rows*hidden + hidden)"
+  validate: {reference: "flashinfer.norm.rmsnorm (tests/test_norm.py)", tolerance: "max abs 1e-2 fp16"}
+  variants:
+    - id: flashinfer
+      role: non_dsmem
+      description: flashinfer.norm.rmsnorm, one CTA per row
+      build: {cwd: third_party/ClusterFusion, cmd: "pip install flashinfer-python"}
+      run:   {cwd: third_party/ClusterFusion, cmd: "python tests/test_norm.py # reference part"}
+      kernels: ["RMSNorm|rmsnorm"]
+      cluster_size: null
+    - id: cluster2
+      role: dsmem
+      description: RMSNormKernel, cluster of 2 CTAs per row, scalar AllReduce via one remote atomicAdd
+      build: {cwd: third_party/ClusterFusion, cmd: "pip install -e ."}
+      run:   {cwd: third_party/ClusterFusion, cmd: "python tests/test_norm.py # clusterfusion.rmsnorm part"}
+      kernels: ["RMSNormKernel"]
+      cluster_size: 2
+scope_layer: null
+measure: {reps: 200, warmup: 20, flush_l2: true}
+notes: Do not build a cluster-1 variant - the single shift-by-1 remote atomicAdd would double the sum. Memory-bound sanity point.

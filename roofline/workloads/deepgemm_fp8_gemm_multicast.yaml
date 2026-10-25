@@ -1,0 +1,42 @@
+name: deepgemm_fp8_gemm_multicast
+paper: DeepGEMM (stand-in for ExpertPlex's Adaptive Persistent Kernel base)
+model: DeepSeek-V3 style FP8 GEMM and MoE grouped GEMM, SM90 1Dx2D block scaling, bf16 output
+runnable: true
+precision: fp8_tensor
+scope_operator:
+  description: D = A . B^T with fp8 e4m3 inputs and fp32 per-128-channel scales; cluster of 2 shares the A or B tile via TMA multicast
+  shapes:
+    m4096_n4096_k7168: {m: 4096, n: 4096, k: 7168, groups: 1}
+    m4096_n7168_k2048: {m: 4096, n: 7168, k: 2048, groups: 1}
+    grouped_8x4096:    {m: 4096, n: 4096, k: 4096, groups: 8}
+  flops: "2*groups*m*n*k"
+  min_hbm_bytes: "groups*(m*k + n*k + 2*m*n + 4*(m*k/128 + n*k/128/128))"
+  validate: {reference: "deep_gemm.testing calc_diff vs torch fp32 (tests/test_fp8_fp4.py)", tolerance: "diff < 1e-3"}
+  variants:
+    - id: cluster1
+      role: non_dsmem
+      description: same JIT kernel with kNumTMAMulticast = 1, forced with patches/deepgemm__force_cluster_1.patch (env DG_FORCE_CLUSTER_1=1)
+      build: {cwd: third_party/DeepGEMM, cmd: "git submodule update --init --recursive && git apply ../../roofline/patches/deepgemm__force_cluster_1.patch && ./develop.sh", patch: patches/deepgemm__force_cluster_1.patch}
+      run:   {cwd: third_party/DeepGEMM, cmd: "DG_FORCE_CLUSTER_1=1 DG_PRINT_CONFIGS=1 DG_USE_NVIDIA_TOOLS=1 python tests/test_fp8_fp4.py  # restricted to {shape}"}
+      kernels: ["sm90_fp8_gemm_1d2d_impl"]
+      cluster_size: 1
+    - id: cluster2
+      role: dsmem
+      description: heuristic-chosen cluster 2 with SM90_TMA_LOAD_MULTICAST of A or B and pairwise remote empty-barrier arrives
+      build: {cwd: third_party/DeepGEMM, cmd: "git submodule update --init --recursive && ./develop.sh"}
+      run:   {cwd: third_party/DeepGEMM, cmd: "DG_PRINT_CONFIGS=1 DG_USE_NVIDIA_TOOLS=1 python tests/test_fp8_fp4.py  # restricted to {shape}; confirm cluster_m/cluster_n == 2 in the printed config"}
+      kernels: ["sm90_fp8_gemm_1d2d_impl"]
+      cluster_size: 2
+    - id: cublaslt
+      role: control
+      description: cuBLASLt FP8 (deep_gemm.cublaslt_gemm_nt), reference throughput
+      build: {cwd: third_party/DeepGEMM, cmd: "./develop.sh"}
+      run:   {cwd: third_party/DeepGEMM, cmd: "python -c 'deep_gemm.cublaslt_gemm_nt(...)' # agent script"}
+      kernels: ["cublasLt|gemm"]
+      cluster_size: null
+scope_layer: null
+measure: {reps: 30, warmup: 10, flush_l2: true}
+notes: >
+  No env var controls the cluster size upstream; the patch adds one. The heuristic only uses cluster 2 when
+  the grid has more than one wave (M=1/128 shapes already run at cluster 1), so check DG_PRINT_CONFIGS.
+  bench_kineto flushes L2 with a 256 MB buffer. Needs CUDA >= 12.9 and C++20.

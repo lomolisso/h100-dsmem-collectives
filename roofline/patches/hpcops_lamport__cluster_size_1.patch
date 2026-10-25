@@ -1,0 +1,13 @@
+diff --git a/src/allreduce/fuse_allreduce_rmsnorm_low_latency.h b/src/allreduce/fuse_allreduce_rmsnorm_low_latency.h
+index 1a2d3a4..c2419cd 100644
+--- a/src/allreduce/fuse_allreduce_rmsnorm_low_latency.h
++++ b/src/allreduce/fuse_allreduce_rmsnorm_low_latency.h
+@@ -471,7 +471,7 @@ inline __device__ T blockReduceSum(T val) {
+ // which always supports CGA.
+ inline std::tuple<int, int, int> adjustGridConfig(int numTokens, int dim, int eltsPerThread) {
+   // B200 always supports CGA, start with the preferred cluster size
+-  int clusterSize = 8;
++  int clusterSize = 1;  // roofline non-DSMEM variant (origin: 8)
+   int blockSize = 128;
+   // ========================== Adjust the grid configuration ==========================
+   int threadsNeeded = ceil_div(dim, eltsPerThread);

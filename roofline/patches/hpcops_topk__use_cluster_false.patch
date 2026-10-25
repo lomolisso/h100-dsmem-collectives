@@ -1,0 +1,14 @@
+diff --git a/src/topk/topk_filtered.cu b/src/topk/topk_filtered.cu
+index b7bea12..de1188a 100644
+--- a/src/topk/topk_filtered.cu
++++ b/src/topk/topk_filtered.cu
+@@ -2865,7 +2865,8 @@ inline DispatchPlan choose_topk2048_plan(int m, int n) {
+   constexpr int kSampleMinN = 32768;
+   constexpr int64_t kWideSampleMinWork = int64_t{32} * 1024 * 1024;
+ 
+-  const bool use_cluster = get_sm_major_version() >= 9 && m > 0 &&
++  // roofline non-DSMEM variant: never pick the cluster-8 kernel; the KV-split / row-local paths are used instead
++  const bool use_cluster = false && get_sm_major_version() >= 9 && m > 0 &&
+                            ((m <= kClusterNarrowMaxRows && n >= kClusterNarrowMinN) ||
+                             (m <= kClusterMaxRows && n >= kClusterMinN));
+   if (use_cluster) {

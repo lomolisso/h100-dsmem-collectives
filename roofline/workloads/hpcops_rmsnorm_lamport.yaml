@@ -1,0 +1,33 @@
+name: hpcops_rmsnorm_lamport
+paper: Tencent hpc-ops (fused AllReduce + RMSNorm, low-latency Lamport mode)
+model: residual-add + RMSNorm of numTokens x hidden bf16, the RMSNorm half of a multi-GPU fused op
+runnable: conditional
+precision: fp32_cuda
+scope_operator:
+  description: h = x + residual; y = h * rsqrt(mean(h^2)+eps) * gamma; hidden dimension split across a cluster per token
+  shapes:
+    t8_h7168:  {tokens: 8,  hidden: 7168}
+    t32_h4096: {tokens: 32, hidden: 4096}
+  flops: "tokens*hidden*6"
+  min_hbm_bytes: "2*(3*tokens*hidden + hidden) + 2*tokens*hidden"
+  validate: {reference: "torch rmsnorm of (x + residual)", tolerance: "max abs 2e-2 bf16"}
+  variants:
+    - id: cluster1
+      role: non_dsmem
+      description: same kernel at cluster size 1 (automatic for >= 67 tokens, or patches/hpcops_lamport__cluster_size_1.patch)
+      build: {cwd: third_party/hpc-ops, cmd: "git apply ../../roofline/patches/hpcops_lamport__cluster_size_1.patch && make sm90 && pip install dist/*.whl", patch: patches/hpcops_lamport__cluster_size_1.patch}
+      run:   {cwd: third_party/hpc-ops, cmd: "torch.ops.hpc.fuse_allreduce_rmsnorm_low_latency(..., world size 1) # agent script"}
+      kernels: ["rmsNormLamport"]
+      cluster_size: 1
+    - id: cluster_c
+      role: dsmem
+      description: rmsNormLamport with cluster {1,c,1}, c = 8/4/2 for small token counts; replicated-push AllReduce of one float
+      build: {cwd: third_party/hpc-ops, cmd: "make sm90 && pip install dist/*.whl"}
+      run:   {cwd: third_party/hpc-ops, cmd: "torch.ops.hpc.fuse_allreduce_rmsnorm_low_latency(..., world size 1) # agent script"}
+      kernels: ["rmsNormLamport"]
+      cluster_size: [8, 4, 2]
+scope_layer: null
+measure: {reps: 100, warmup: 20, flush_l2: true}
+notes: >
+  Multi-GPU op (world size >= 2, NVLink Lamport buffers). Only runnable if the op accepts world size 1 on a
+  single GPU; otherwise skip and record why. Alternative baseline: rmsnorm_fusion=False + flashinfer.fused_add_rmsnorm.

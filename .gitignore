@@ -8,3 +8,5 @@
 # build and measurement outputs of the collectives study
 collectives/build/
 collectives/results/
+roofline/results/
+roofline/build/
