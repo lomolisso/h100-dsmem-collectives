@@ -22,29 +22,36 @@ nvcc -arch=sm_90a -std=c++17 -O3 -lineinfo -Xptxas -v -I ../common/h100mb \
 |---|---|
 | file | every `collectives/*.cu` (29 files) |
 | N | 2, 4, 8, 16 (16 is non-portable: set `cudaFuncAttributeNonPortableClusterSizeAllowed`) |
-| M (elements) | 16, 64, 256, 1024, 4096 |
+| M (elements) | 16, 64, 256, 1024, 4096, 16384, plus per (file, N, T) `M_max` = the largest M whose shared memory fits 227 KiB (affine fit of the two largest OK grid builds, rounded down to a multiple of 16·N; `harness/driver.py`) |
 | T | `float` (all files), `int` (all reduce files with `Sum`: exact check) |
 
 Expected compile failures (record them as `SKIP:static_assert` / `SKIP:smem`, never as errors):
 - `static_assert` on N (pow2 files at N not pow2 — none in this matrix; `N == 4` and `N ∈ {2,4}` for
   the ClusterFusion shipped variants; `N == 2` for `alltoall__pairwise_exchange__fa4`; `N | M`, `N | 32`).
-- Static smem over 48 KB (`ptxas error: ... uses too much shared data`). Static smem per file, in elements of T:
-  allreduce files: 2M (one-shot/atomic/replicated: 2M–3M, slots N·M), ring: M + M/N, rabenseifner/recursive
-  doubling/shift: 3M; allgather: N·M (+M); reducescatter: N·M + M (recursive halving: 1.5·N·M; direct push: 2·N·M);
-  alltoall: 2·N·M (Bruck: 1.5·N·M). Compute the limit from `ptxas -v` output rather than trusting these figures.
-  Measured by C1 (`ptxas -v`, `results/build_matrix.csv`): the figures hold except `allreduce__rabenseifner__mpich`
-  = 1.5·M (never over the limit in this matrix) and `allreduce__2d_mesh__generic` = 2.5/3.5/2.75/3.25·M for
-  N = 2/4/8/16 (over the limit at M = 4096 for N = 4 and 16). The limit is inclusive: exactly 49 152 B compiles
-  (e.g. `allgather__direct_pull__generic` N = 2, M = 4096). Extra `static_assert`: `allreduce__shift_accumulate_atomic__clusterfusion`
-  requires M ≤ 1024 (one element per thread), so its M = 4096 configurations are `SKIP:static_assert`.
+- Shared memory over **227 KiB = 232 448 B per CTA** (the H100 per-block opt-in maximum; all files use dynamic
+  shared memory, `struct CollectiveSmem`): `harness/main.cu` `static_assert`s `sizeof(CollectiveSmem) <= 232448`
+  with a message starting `SMEM_LIMIT` → `SKIP:smem`. Shared memory per file, in elements of T (measured,
+  `smem_bytes` in `results/build_matrix_v2.csv`; struct padding adds ≤ 8 B): allreduce one-shot/atomic/reduce-bcast:
+  2M; recursive doubling/shift bulk: 3M; rabenseifner: 1.5·M; ring: M + M/N; two-shot: 2M; replicated push:
+  (N+2)·M; hpcops: M; shift atomic: M; 2d mesh: 2.5/3.5/2.75/3.25·M for N = 2/4/8/16; allgather: N·M (+M);
+  reducescatter: N·M + M (recursive halving: 1.5·N·M; direct push: 2·N·M + M); alltoall: 2·N·M (Bruck: 1.5·N·M;
+  fa4: N·M + M). Extra `static_assert`: `allreduce__shift_accumulate_atomic__clusterfusion` requires M ≤ 1024
+  (one element per thread), so its larger configurations are `SKIP:static_assert`. The harness's `SMEM_LIMIT`
+  check is at namespace scope and the compiler stops there, so an over-limit configuration is `SKIP:smem` even if
+  it would also violate an N/M constraint (only `alltoall__pairwise_exchange__fa4` at N ≥ 4, large M). The struct
+  keeps every declared buffer, also one the algorithm does not use for some N (`allreduce__2d_mesh__generic`
+  N = 2: `col_slots`, 0.5·M), which the static build let the compiler drop. (C1's first build used static shared
+  memory and its 48 KiB limit: `results/build_matrix.csv`, superseded.)
 
 ## 2. Host harness (`harness/main.cu`)
 
 1. Allocate `in`, `out`, `ts[N*32]`, `smid[N]` on the device; fill `in` on the host with a deterministic
    pattern (see §3), copy, zero `out`/`ts`.
-2. Launch `collective_kernel<<<N, 256>>>` (the `__cluster_dims__` attribute sets the cluster); for N = 16
-   use `cudaLaunchKernelEx` with the cluster-dimension attribute after setting the non-portable attribute.
-   Check `cudaOccupancyMaxActiveClusters >= 1` first and record it.
+2. Launch `collective_kernel<<<N, 256, sizeof(CollectiveSmem)>>>` (the `__cluster_dims__` attribute sets the
+   cluster) after `cudaFuncSetAttribute(..., cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(CollectiveSmem))`;
+   for N = 16 also set `cudaFuncAttributeNonPortableClusterSizeAllowed` (C1 verified that the plain launch then
+   works with the compile-time cluster size). Check `cudaOccupancyMaxActiveClusters >= 1` first (with the same
+   dynamic smem size) and record it.
 3. Watchdog: record a `cudaEvent` after the launch and poll `cudaEventQuery` from the host; if it is not
    done after `TIMEOUT_MS` (default 5000) print `DEADLOCK <file> N M T` plus whatever `ts` stamps are
    readable via a *separate* non-blocking stream copy (they may not be), and `_exit(3)`. The driver

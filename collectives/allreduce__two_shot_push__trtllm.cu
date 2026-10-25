@@ -58,12 +58,20 @@ __device__ void allreduce_two_shot_push(T* buf, T (*slots)[M / N], uint32_t bar_
     st.round(1);
 }
 
+// Shared buffers of one CTA, taken from the dynamic shared-memory window (dsmem_primitives.cuh, dyn_smem);
+// the launcher passes sizeof(CollectiveSmem) as the dynamic smem size (up to 227 KiB per CTA).
+struct CollectiveSmem {
+    static constexpr int N = CLUSTER_N, M = MSG_ELEMS;
+    __align__(16) ELEM_T buf[M];
+    __align__(16) ELEM_T slots[N][M / N];
+    __align__(8) uint64_t bars[2];
+};
+
 __global__ void __cluster_dims__(CLUSTER_N, 1, 1)
 collective_kernel(const ELEM_T* in, ELEM_T* out, unsigned long long* ts, unsigned* smid_out) {
     constexpr int N = CLUSTER_N, M = MSG_ELEMS;
-    __shared__ __align__(16) ELEM_T buf[M];
-    __shared__ __align__(16) ELEM_T slots[N][M / N];
-    __shared__ __align__(8) uint64_t bars[2];
+    CollectiveSmem& sm = dyn_smem<CollectiveSmem>();
+    auto& buf = sm.buf; auto& slots = sm.slots; auto& bars = sm.bars;
     const uint32_t rank = cluster_rank();
     Stamps st{ts + rank * kStamps};
 

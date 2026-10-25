@@ -214,7 +214,17 @@ struct Max {
 // Timestamps: ts[b*kStamps + 0] entry (after the entry cluster_sync),
 //             ts[b*kStamps + 1] exit (after the last barrier of the collective),
 //             ts[b*kStamps + 2 + r] end of round r (optional). smid[b] = SM id.
+// Shared memory: each file declares a namespace-scope `struct CollectiveSmem` with all its shared buffers and
+// takes it from the dynamic shared-memory window with dyn_smem<CollectiveSmem>() (no static __shared__
+// arrays). The launcher passes sizeof(CollectiveSmem) as the dynamic smem size and opts in beyond 48 KiB
+// (cudaFuncAttributeMaxDynamicSharedMemorySize), up to the 227 KiB a block may use on H100.
 constexpr int kStamps = 32;
+
+// The kernel's dynamic shared-memory window. It starts at the same shared::cta offset in every CTA of the
+// kernel, so mapa(smem_u32(&member), r) addresses the same member in CTA r.
+extern __shared__ __align__(16) unsigned char dyn_smem_raw[];
+template <class S>
+__device__ __forceinline__ S& dyn_smem() { return *reinterpret_cast<S*>(dyn_smem_raw); }
 
 struct Stamps {
     unsigned long long* base;   // &ts[rank * kStamps]

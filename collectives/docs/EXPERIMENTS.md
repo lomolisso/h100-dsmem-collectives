@@ -72,7 +72,7 @@ Report per configuration: median over reps of `L`, `algbw`, `busbw`; p10/p90 of 
 |---|---|
 | file | all 29 (skipping configurations illegal per `TESTING.md` §1) |
 | N | 2, 4, 8, 16 |
-| payload per CTA | 256 B, 1 KB, 4 KB, 16 KB, 64 KB (choose `MSG_ELEMS` accordingly; cap by the 48 KB static smem limit and record the cap) |
+| payload per CTA | 256 B, 1 KB, 4 KB, 16 KB, 64 KB, plus the largest payload that fits the 227 KiB per-CTA shared-memory limit (the `M_max` builds of `results/build_matrix_v2.csv`); choose `MSG_ELEMS` accordingly and record the cap per file and N |
 | T | `float` (add `__half` only if a file supports it) |
 | reps | 20 warm-up + 200 timed launches per configuration; one process per configuration |
 

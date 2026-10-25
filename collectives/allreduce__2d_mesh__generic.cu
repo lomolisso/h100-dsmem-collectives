@@ -95,14 +95,22 @@ __device__ void allreduce_2d_mesh(T* buf, T (*row_slots)[M / Grid2D<N>::C], T (*
     st.round(2);
 }
 
+// Shared buffers of one CTA, taken from the dynamic shared-memory window (dsmem_primitives.cuh, dyn_smem);
+// the launcher passes sizeof(CollectiveSmem) as the dynamic smem size (up to 227 KiB per CTA).
+struct CollectiveSmem {
+    static constexpr int N = CLUSTER_N, M = MSG_ELEMS, C = Grid2D<N>::C, R = Grid2D<N>::R;
+    __align__(16) ELEM_T buf[M];
+    __align__(16) ELEM_T row_slots[C][M / C];
+    __align__(16) ELEM_T col_slots[R][M / C];
+    __align__(16) ELEM_T chunk[M / C];
+    __align__(8) uint64_t bars[3];
+};
+
 __global__ void __cluster_dims__(CLUSTER_N, 1, 1)
 collective_kernel(const ELEM_T* in, ELEM_T* out, unsigned long long* ts, unsigned* smid_out) {
     constexpr int N = CLUSTER_N, M = MSG_ELEMS, C = Grid2D<N>::C, R = Grid2D<N>::R;
-    __shared__ __align__(16) ELEM_T buf[M];
-    __shared__ __align__(16) ELEM_T row_slots[C][M / C];
-    __shared__ __align__(16) ELEM_T col_slots[R][M / C];
-    __shared__ __align__(16) ELEM_T chunk[M / C];
-    __shared__ __align__(8) uint64_t bars[3];
+    CollectiveSmem& sm = dyn_smem<CollectiveSmem>();
+    auto& buf = sm.buf; auto& row_slots = sm.row_slots; auto& col_slots = sm.col_slots; auto& chunk = sm.chunk; auto& bars = sm.bars;
     const uint32_t rank = cluster_rank();
     Stamps st{ts + rank * kStamps};
 

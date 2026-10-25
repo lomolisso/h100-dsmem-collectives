@@ -13,8 +13,9 @@
 Only `collectives/` is in scope: every `<op>__<alg>__<src>.cu` must (1) compile for `sm_90a`,
 (2) produce correct results for every legal configuration, (3) never deadlock or race, and (4) be
 benchmarked for latency and bandwidth per `docs/EXPERIMENTS.md`, with figures in
-`analysis/dsmem_collectives.ipynb`. `kernels/` and `third_party/` are reference material and are not
-compiled here. This study also owns what was planned as experiment 17 of h100-microbench
+`analysis/dsmem_collectives.ipynb`. **The 29 algorithm files are modifiable:** they are untested
+implementations, and C2–C5 exist to find and fix their bugs (see *Workflow* item 3). `kernels/` and
+`third_party/` are reference material and are not compiled here. This study also owns what was planned as experiment 17 of h100-microbench
 (`h100-microbench/docs/experiments/17__dsmem_collectives.md`, reference input for task C7).
 
 ## Starting a new conversation
@@ -52,7 +53,8 @@ Follow `../CLAUDE.md` ("Starting a new conversation"): the task is the first row
   (`common/h100mb/PROVENANCE.md`).
 - Exact build and run commands (C1; run from the repo root, `TR=~/work/fa2026/iacoma/h100-microbench/tools/run`):
   - build matrix: `$TR --no-gpu -- python3 collectives/harness/driver.py build --jobs 16` (per configuration the
-    TESTING §1 command plus `-DCOLL_NAME='"<file>"' -DCOLL_OP=<0..3>`; see the driver docstring);
+    TESTING §1 command plus `-DCOLL_NAME='"<file>"' -DCOLL_OP=<0..3>`; writes `results/build_matrix_v2.csv`, grid +
+    `M_max` points; see the driver docstring);
     status matrix: `python3 collectives/harness/driver.py summary`.
   - CS-16 launch check and vendored-harness self-test (no clock lock):
     `$TR -- bash -c './build/trap_cs16; ./build/harness_selftest'` from `collectives/` (binaries built with
@@ -76,23 +78,27 @@ Follow `../CLAUDE.md` ("Starting a new conversation"): the task is the first row
   (32 ns tick on this device: small-message latencies are quantised; report medians over reps).
 - `static_assert`s encode legal configurations (power-of-two N, N == 4, N == 2, N | M, 16-byte multiples).
   A `static_assert` failure is an *expected* compile failure for that configuration, not a bug.
-- Static shared memory is used; configurations whose arrays exceed 48 KB fail in `ptxas` and are
-  skipped (`docs/TESTING.md` gives the per-file formula). Do not convert files to dynamic smem unless the
-  user asks.
+- Shared memory is **dynamic**, up to the full **227 KiB (232 448 B) per CTA** a block may opt in to on H100:
+  each file declares all its shared buffers in a namespace-scope `struct CollectiveSmem` and takes it with
+  `CollectiveSmem& sm = dyn_smem<CollectiveSmem>();` (`dsmem_primitives.cuh`); no static `__shared__` arrays
+  (static shared memory is capped at 48 KiB). The launcher passes `sizeof(CollectiveSmem)` as the dynamic size
+  and sets `cudaFuncAttributeMaxDynamicSharedMemorySize`; the harness `static_assert`s the 227 KiB limit
+  (message `SMEM_LIMIT`, classified `SKIP:smem`). New or rewritten files follow the same pattern.
 
 ## Workflow (the tasks of `ROADMAP.md`)
 
 1. C1: record the tooling above, vendor the microbench harness (`../docs/REUSE.md`), build the harness
-   described in `docs/TESTING.md` under `collectives/harness/` (new directory; the algorithm files must stay
-   untouched except for genuine bug fixes), and the compile matrix.
+   described in `docs/TESTING.md` under `collectives/harness/`, and the compile matrix.
 2. C2–C3: correctness matrix; C4: deadlock/race checks and sanity checks; C5: performance sweep from
    `docs/EXPERIMENTS.md`; C6: the notebook; C7 (optional): the extensions taken over from microbench 17.
-3. If an algorithm file is wrong, fix the smallest thing that makes it correct, keep the algorithm's
-   pattern (rounds, partners, message sizes) unchanged, and log the fix in the *Change log* below with
-   the failing configuration and the root cause. Never "fix" a failure by skipping it, loosening a
-   tolerance beyond what `docs/TESTING.md` allows, or adding barriers that change the algorithm's
-   round structure without saying so in the docstring. If a fix changes the README traffic model, update
-   `README.md` in the same commit.
+3. The algorithm files are modifiable and are expected to need fixes: change a file whenever correctness,
+   sanitizer, deadlock, traffic or performance-sanity checks show it is wrong (or when the user asks).
+   Log every change in the *Change log* below (file, failing configuration or reason, root cause, what
+   changed). Prefer the fix that keeps the algorithm the file is named after (its rounds, partners,
+   message sizes); if a correct implementation needs a different pattern, extra barriers or different
+   traffic, make the change and update the file's docstring and its `README.md` row in the same commit.
+   Never make a failure disappear by skipping the configuration, loosening a tolerance beyond what
+   `docs/TESTING.md` allows, or dropping data.
 4. Report at the end of every task: which files pass which configurations, which were fixed and how, where
    the results and figures live, and anything that could not be measured and why.
 
@@ -116,4 +122,10 @@ Follow `../CLAUDE.md` ("Starting a new conversation"): the task is the first row
 
 ## Change log  *(append entries here)*
 
-- _none yet_
+- 2026-10-25 (C1 revision, requested by the user): **all 29 files moved from static `__shared__` arrays to
+  dynamic shared memory** (`struct CollectiveSmem` + `dyn_smem<>()`, `dsmem_primitives.cuh`) so every
+  configuration can use up to 227 KiB per CTA instead of the 48 KiB static limit. Only the declarations
+  changed (same buffers, names, types, sizes and alignment; struct padding adds ≤ 8 B); no algorithm logic
+  changed. Harness: dynamic size + opt-in attribute + `SMEM_LIMIT` static_assert; build matrix M axis extended
+  with 16384 and a per-(file, N, T) `M_max` point (largest M that fits). The docs now state that the
+  algorithm files are modifiable.

@@ -41,11 +41,19 @@ __device__ void allreduce_shift_accumulate_atomic(T* val, Stamps st) {
     }
 }
 
+// Shared buffers of one CTA, taken from the dynamic shared-memory window (dsmem_primitives.cuh, dyn_smem);
+// the launcher passes sizeof(CollectiveSmem) as the dynamic smem size (up to 227 KiB per CTA).
+struct CollectiveSmem {
+    static constexpr int N = CLUSTER_N, M = MSG_ELEMS;
+    ELEM_T val[M];
+};
+
 __global__ void __cluster_dims__(CLUSTER_N, 1, 1)
 collective_kernel(const ELEM_T* in, ELEM_T* out, unsigned long long* ts, unsigned* smid_out) {
     constexpr int N = CLUSTER_N, M = MSG_ELEMS;
     static_assert(M <= 1024, "one element per thread in this variant");
-    __shared__ ELEM_T val[M];
+    CollectiveSmem& sm = dyn_smem<CollectiveSmem>();
+    auto& val = sm.val;
     const uint32_t rank = cluster_rank();
     Stamps st{ts + rank * kStamps};
 

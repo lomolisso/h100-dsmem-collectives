@@ -12,6 +12,9 @@ with compile-time knobs `-DCLUSTER_N= -DMSG_ELEMS= -DELEM_T=` (defaults 4, 1024,
 launch, per-rank input/output layouts and timestamp slots defined at the bottom of `dsmem_primitives.cuh`
 (`ts[rank*32+0]` entry, `+1` exit, `+2+r` end of round r; `smid[rank]`). `M` below is `MSG_ELEMS`, the
 per-CTA payload for allreduce/allgather and the chunk size for reducescatter/alltoall. `B = sizeof(ELEM_T)`.
+Shared buffers live in dynamic shared memory: each file's `struct CollectiveSmem` (taken with
+`dyn_smem<CollectiveSmem>()`), launched with `sizeof(CollectiveSmem)` bytes, up to the 227 KiB per CTA that H100
+allows, so M can grow until that limit (`docs/TESTING.md` §1 gives the size per file).
 
 | File | Op | Algorithm / logical topology | Rounds | Bytes per message | Total DSMEM bytes per CTA | Cluster barriers | Primitive | Source | N constraint |
 |---|---|---|---|---|---|---|---|---|---|

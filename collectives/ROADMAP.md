@@ -12,7 +12,7 @@ user's review, not pushed) · `done` (approved and pushed). Update the row **bef
 
 | ID | Task | Status | Key results for later tasks |
 |---|---|---|---|
-| C1 | Environment, vendored harness, build matrix, GPU smoke test | done | **Prereq:** microbench GPU-3 bring-up done in this conversation (commit `89ff996`, row `in review` there): lock **1635 MHz** on GPU 3; GPU-3 map = run `2026-10-25T19:56:47.043+00:00` of `03__sm_gpc_topology__map.csv`, identical to GPU 2 (SMs 124–131 only in CS ≤ 2; partition columns empty). **Harness:** `harness/main.cu` (modes correctness/perf/ncu, `--baseline`), `harness/driver.py` (build/run/summary), `harness/trap_cs16.cu`, `harness/ncu_discovery.sh`; vendored `common/h100mb/` (microbench `14875a5`, path fix only). **Launch path:** compile-time `__cluster_dims__(16)` compiles; plain `<<<N,256>>>` works once `NonPortableClusterSizeAllowed` is set (fails before), `cudaLaunchKernelEx` with an equal cluster attribute is also accepted; `cudaOccupancyMaxActiveClusters` works without the attribute (CS 4/8/16 at 256 thr, small smem: 248/124/58). Harness self-test (microbench 01 T1–T7) passes on the vendored copy. **Build matrix** (`results/build_matrix.csv`, 900 configurations, 326 s at 16 jobs, `build/` 767 MB): **694 OK, 81 SKIP:static_assert, 125 SKIP:smem, 0 ERROR**, no spills, ≤ 29 regs. Legal configurations for C2: allreduce 195 float + 195 int; for C3: allgather 112, alltoall 74, reducescatter 59 float + 59 int. Skips match TESTING §1 except (now noted there): rabenseifner uses 1.5·M smem (never skipped), 2d_mesh 2.5–3.5·M (skipped at M = 4096, N = 4/16), shift_accumulate_atomic has an extra `M ≤ 1024` assert; the 48 KB limit is inclusive. **Smoke** (N = 4, fa4 N = 2; M = 256 float; pattern A; 5 reps; lock 1635): **29/29 PASS**, 0 deadlocks, 0 clock-flagged launches, ranks always on distinct SMs (CS 4 → SMs 0/1/16/17 = G0, CS 2 → 124/125); median latency 224 ns (fa4 N = 2) … 2.75 µs (ring allreduce). **ncu:** DSMEM payload = `l1tex__m_l1tex2xbar_write_bytes_mem_dshared.sum` = `l1tex__m_xbar2l1tex_read_bytes_mem_dshared.sum` = exactly the payload for bulk push (`_op_tma_st`), store push (`_op_st`) and pull (`_op_ld`); baseline 0; LSU `t_*` metrics miss bulk copies; `lts__t_sectors_srcunit_tex` counts the kernel's global I/O (not ≈ 0) — EXPERIMENTS §1. **Note:** 4 misaligned rows from a first driver test (extra empty mandatory field) are kept in `results/build_matrix__c1_driver_test_misaligned_2026-10-25.csv`, not used. GPU time ≈ 20 min. |
+| C1 | Environment, vendored harness, build matrix, GPU smoke test | in review | **Prereq:** microbench GPU-3 bring-up done in this conversation (commit `89ff996`, row `in review` there): lock **1635 MHz** on GPU 3; GPU-3 map = run `2026-10-25T19:56:47.043+00:00` of `03__sm_gpc_topology__map.csv`, identical to GPU 2 (SMs 124–131 only in CS ≤ 2; partition columns empty). **Harness:** `harness/main.cu` (modes correctness/perf/ncu, `--baseline`), `harness/driver.py` (build/run/summary), `harness/trap_cs16.cu`, `harness/ncu_discovery.sh`; vendored `common/h100mb/` (microbench `14875a5`, path fix only). **Launch path:** dynamic smem `<<<N, 256, sizeof(CollectiveSmem)>>>` after `cudaFuncAttributeMaxDynamicSharedMemorySize`; compile-time `__cluster_dims__(16)` compiles; plain `<<<N,256>>>` works once `NonPortableClusterSizeAllowed` is set (fails before), `cudaLaunchKernelEx` with an equal cluster attribute is also accepted; `cudaOccupancyMaxActiveClusters` works without the attribute (CS 4/8/16 at 256 thr, small smem: 248/124/58). Harness self-test (microbench 01 T1–T7) passes on the vendored copy. ~~First build (static shared memory, 48 KiB limit; `results/build_matrix.csv`): 900 configurations, 694 OK, 81 SKIP:static_assert, 125 SKIP:smem, 0 ERROR.~~ Superseded by the **C1 revision (2026-10-25, user request): all 29 files use dynamic shared memory up to 227 KiB per CTA** (`struct CollectiveSmem`, CLAUDE.md change log) and the docs declare the algorithm files modifiable. **Build matrix v2** (`results/build_matrix_v2.csv`; grid M ∈ {16,64,256,1024,4096,16384} = 1080 configurations plus `M_max` search points): **0 ERROR**; latest status 1181 OK, 118 SKIP:static_assert, 106 SKIP:smem. **Runnable set for C2/C3 = grid OK + the largest OK `M_max` per (file, N, T) = 1043 configurations**: allreduce 284 float + 284 int (C2); allgather 168, alltoall 119, reducescatter 94 float + 94 int (C3); `driver.py run` selects exactly these (138 lower `M_max` search builds are kept in the matrix but not run). `M_max` reaches 226–227 KiB for every (file, N, T) except algorithmic caps: shift_accumulate_atomic M ≤ 1024 (N = 2/4), shift_accumulate_bulk N = 4 only, fa4 N = 2 only; e.g. allreduce ring N = 16 → M = 54 656, hpcops → 58 112, alltoall direct push N = 16 → 1 812, allgather N = 16 → 3 416–3 628 (`driver.py summary`). Conversion check: for the 694 configurations that built statically, the dynamic size equals the static one (280) or +8 B struct padding (404); the 10 others are 2d_mesh N = 2, whose unused `col_slots` (0.5·M) the static build had dropped (TESTING §1). 97 configurations that were SKIP:smem now build. Skip formulas per file: TESTING §1. **Smoke** (N = 4, fa4 N = 2; M = 256 float; pattern A; 5 reps; lock 1635): **29/29 PASS**, 0 deadlocks, 0 clock-flagged launches, ranks always on distinct SMs (CS 4 → SMs 0/1/16/17 = G0, CS 2 → 124/125); median latency 224 ns (fa4 N = 2) … 2.75 µs (ring allreduce). **Smoke after the revision** (same small configuration + the largest-smem OK configuration of every file, up to 227 KiB/CTA at N = 16; 5 reps): **57/58 PASS**, 0 deadlocks, 0 clock-flagged; **FAIL: `allreduce__shift_accumulate_atomic__clusterfusion` N = 4, M = 1024, int** (5/5 reps): thread e owns element e (`if (threadIdx.x < M)`) and the harness runs 256 threads, so elements 256…1023 are never reduced — a genuine bug (the `M ≤ 1024` assert assumes 1024 threads), independent of the shared-memory change, left for C2. **ncu:** DSMEM payload = `l1tex__m_l1tex2xbar_write_bytes_mem_dshared.sum` = `l1tex__m_xbar2l1tex_read_bytes_mem_dshared.sum` = exactly the payload for bulk push (`_op_tma_st`), store push (`_op_st`) and pull (`_op_ld`); baseline 0; LSU `t_*` metrics miss bulk copies; `lts__t_sectors_srcunit_tex` counts the kernel's global I/O (not ≈ 0) — EXPERIMENTS §1. **Note:** 4 misaligned rows from a first driver test (extra empty mandatory field) are kept in `results/build_matrix__c1_driver_test_misaligned_2026-10-25.csv`, not used. GPU time ≈ 20 min. |
 | C2 | Correctness: AllReduce (12 files) | todo | |
 | C3 | Correctness: AllGather (7), ReduceScatter (4), AlltoAll (6) | todo | |
 | C4 | Sanitizers, deadlock/race checks, placement and traffic sanity | todo | |
@@ -39,7 +39,10 @@ bring-up is done; its GPU smoke step cannot. This roadmap does not depend on `ro
   `$TR --profile --lock-sm-mhz <LOCK> -- …` on GPU 3 (`<LOCK>` from h100-microbench `docs/context/10` §2).
 - Results: `collectives/results/` (git-ignored), mandatory columns first, append-only, run registry
   `results/collectives__runs.csv`. Builds: `collectives/build/` (git-ignored).
-- The algorithm files are frozen except for genuine bug fixes (logged in `CLAUDE.md` → Change log).
+- The algorithm files are modifiable: they are untested, and every task fixes what its checks show is wrong
+  (`CLAUDE.md` → Workflow item 3; every change logged in `CLAUDE.md` → Change log).
+- Shared memory is dynamic, up to 227 KiB per CTA (`CLAUDE.md` → File contract); the build matrix covers
+  M ∈ {16, 64, 256, 1024, 4096, 16384} plus the largest M that fits per (file, N, T) (`M_max`).
 
 ---
 
@@ -73,13 +76,13 @@ configurations.
    `cudaLaunchKernelEx` accepts a cluster attribute equal to the compile-time one. Do not use
    `hb::ClusterLaunch` with `explicit_cluster` on these kernels unless that test passes. If CS 16 cannot work
    without editing the algorithm files, stop and ask the user.
-5. `harness/driver.py`: enumerates (file, N ∈ {2,4,8,16}, M ∈ {16,64,256,1024,4096}, T ∈ {float, int for
-   reduce files}); builds each into `build/<file>__N<N>_M<M>_<T>` with the TESTING §1 command plus
+5. `harness/driver.py`: enumerates (file, N ∈ {2,4,8,16}, M ∈ {16,64,256,1024,4096} — since the C1 revision
+   {…, 16384} plus `M_max` — T ∈ {float, int for reduce files}); builds each into `build/<file>__N<N>_M<M>_<T>` with the TESTING §1 command plus
    `-Xptxas -v`; classifies `OK` / `SKIP:static_assert` / `SKIP:smem` / `ERROR` from the compiler output;
    runs configurations as child processes with a timeout; resumable (skips configurations already complete
    in the registry). Parallel builds capped at 16 jobs (the host is shared).
 6. Build the full matrix (≈ 29 × 20 float + 16 × 20 int ≈ 900 builds; expect 1–2 h of CPU at 16 jobs) and
-   write `results/build_matrix.csv` (`file, op, alg, N, M, T, status, static_smem_bytes, regs, spill_bytes,
+   write `results/build_matrix.csv` (since the C1 revision: `results/build_matrix_v2.csv`, + `grid`, `smem_bytes`) (`file, op, alg, N, M, T, status, static_smem_bytes, regs, spill_bytes,
    ptxas_msg`). Every `ERROR` that is not an expected `static_assert`/smem failure is a bug: fix it per the
    `CLAUDE.md` workflow or list it for C2/C3.
 7. GPU smoke: one configuration per file (N = 4, or the file's only legal N; M = 256; pattern A; 5 reps).
@@ -129,8 +132,8 @@ GPU time ≈ 30–60 min (≈ 12 × 20 × 3 configurations × 3 processes, a few
 ## C3 — Correctness: AllGather (7), ReduceScatter (4), AlltoAll (6)
 **Goal / steps / deliverables.** As C2, for the 17 data-movement and reduce-scatter files. AllGather and
 AlltoAll are pure data movement: bit-exact for every pattern. ReduceScatter uses `Sum`: int and pattern A
-exact. Note the smem-heavy layouts (`N·M`, `2·N·M`): many large-N/large-M configurations are expected
-`SKIP:smem` from C1.
+exact. Note the smem-heavy layouts (`N·M`, `2·N·M`): their large-N/large-M configurations exceed 227 KiB and are
+`SKIP:smem` in C1's matrix; their `M_max` points are the largest messages that fit.
 
 **Prerequisites.** C1 `done`; GPU-3 bring-up `done`. Independent of C2.
 
@@ -183,8 +186,8 @@ names, baseline traffic).
 
 **Steps.**
 1. `driver.py --mode perf`: 20 warm-up + 200 timed launches per configuration, one process per configuration,
-   final correctness check after the timed loop; payloads 256 B … 64 KB per CTA (cap by the 48 KB static
-   smem limit and record the cap per file); randomised configuration order; the full sweep twice (drift).
+   final correctness check after the timed loop; payloads 256 B … 64 KB per CTA plus the largest
+   payload that fits the 227 KiB shared-memory limit (the `M_max` points; record the cap per file and N); randomised configuration order; the full sweep twice (drift).
    Clock note before/after each configuration; launches below the lock are discarded and counted.
 2. Output `results/stamps.csv`, `results/host.csv` (EXPERIMENTS §5, mandatory columns first). **Size
    estimate first**: ≈ 200 reps × N ranks × (2 + rounds) stamps per configuration; if a file would approach

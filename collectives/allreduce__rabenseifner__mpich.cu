@@ -66,12 +66,20 @@ __device__ void allreduce_rabenseifner(T* buf, T* scratch, uint32_t bar, Op op, 
     }
 }
 
+// Shared buffers of one CTA, taken from the dynamic shared-memory window (dsmem_primitives.cuh, dyn_smem);
+// the launcher passes sizeof(CollectiveSmem) as the dynamic smem size (up to 227 KiB per CTA).
+struct CollectiveSmem {
+    static constexpr int N = CLUSTER_N, M = MSG_ELEMS;
+    __align__(16) ELEM_T buf[M];
+    __align__(16) ELEM_T scratch[M / 2];
+    __align__(8) uint64_t bar;
+};
+
 __global__ void __cluster_dims__(CLUSTER_N, 1, 1)
 collective_kernel(const ELEM_T* in, ELEM_T* out, unsigned long long* ts, unsigned* smid_out) {
     constexpr int N = CLUSTER_N, M = MSG_ELEMS;
-    __shared__ __align__(16) ELEM_T buf[M];
-    __shared__ __align__(16) ELEM_T scratch[M / 2];
-    __shared__ __align__(8) uint64_t bar;
+    CollectiveSmem& sm = dyn_smem<CollectiveSmem>();
+    auto& buf = sm.buf; auto& scratch = sm.scratch; auto& bar = sm.bar;
     const uint32_t rank = cluster_rank();
     Stamps st{ts + rank * kStamps};
 

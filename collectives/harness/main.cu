@@ -10,6 +10,12 @@
  * Launch: one cluster per launch, gridDim = CLUSTER_N, blockDim = --threads (256); the cluster size comes from the
  * kernel's compile-time __cluster_dims__ (plain <<<>>> launch; CLUSTER_N > 8 also sets
  * cudaFuncAttributeNonPortableClusterSizeAllowed — the launch path validated by harness/trap_cs16.cu).
+ * Shared memory: the file's `struct CollectiveSmem` lives in dynamic shared memory; kSmemBytes =
+ * sizeof(CollectiveSmem) is passed as the dynamic size of every launch (and of the occupancy query), with
+ * cudaFuncAttributeMaxDynamicSharedMemorySize set to it. A configuration needing more than kSmemLimit =
+ * 232448 B (227 KiB, the H100 per-block opt-in maximum) fails to compile with a static_assert whose message
+ * starts with SMEM_LIMIT (driver.py: SKIP:smem). The value is also embedded in the binary as the string
+ * "COLLECTIVE_SMEM_BYTES=<n>;" so driver.py can read it without running the binary.
  * Before every launch `out` and `ts` are zeroed and `smid` set to 0xffffffff (outside the kernel, so the
  * in-kernel %globaltimer stamps are not affected); a cudaEvent pair brackets the kernel alone (event_ms).
  *
@@ -65,7 +71,7 @@
 #error "compile with -DCOLL_OP=<0 allreduce|1 allgather|2 reducescatter|3 alltoall>"
 #endif
 
-// Same grid, block and compile-time cluster as collective_kernel, does nothing: same-grid ncu baseline.
+// Same grid, block, compile-time cluster and dynamic smem as collective_kernel, does nothing: same-grid ncu baseline.
 __global__ void __cluster_dims__(CLUSTER_N, 1, 1)
 baseline_kernel(const ELEM_T*, ELEM_T*, unsigned long long*, unsigned*) {}
 
@@ -80,6 +86,27 @@ constexpr size_t kOutElems = (OP == 0 || OP == 2) ? (size_t)N * M : (size_t)N * 
 constexpr size_t kPayloadBytes = ((OP == 0 || OP == 1) ? (size_t)M : (size_t)N * M) * sizeof(ELEM_T);
 constexpr bool kIsInt = std::is_same<ELEM_T, int>::value;
 static_assert(kIsInt || std::is_same<ELEM_T, float>::value, "ELEM_T must be float or int");
+constexpr size_t kSmemBytes = sizeof(CollectiveSmem);
+constexpr size_t kSmemLimit = 232448;  // cudaDevAttrMaxSharedMemoryPerBlockOptin on H100 (227 KiB)
+static_assert(kSmemBytes <= kSmemLimit, "SMEM_LIMIT: CollectiveSmem exceeds the 227 KiB a block may opt in to");
+
+// "COLLECTIVE_SMEM_BYTES=<kSmemBytes>;" as a host string kept in the binary (read by driver.py).
+struct SmemTag {
+    char s[48];
+};
+constexpr SmemTag make_smem_tag(size_t v) {
+    SmemTag t{};
+    const char head[] = "COLLECTIVE_SMEM_BYTES=";
+    int n = 0;
+    for (int i = 0; head[i]; ++i) t.s[n++] = head[i];
+    char d[24]{};
+    int k = 0;
+    do { d[k++] = char('0' + v % 10); v /= 10; } while (v);
+    while (k) t.s[n++] = d[--k];
+    t.s[n++] = ';';
+    return t;
+}
+__attribute__((used)) const SmemTag kSmemTag = make_smem_tag(kSmemBytes);
 
 std::string alg_name() {  // <op>__<alg>__<src> → <alg>
     std::string f = COLL_NAME;
@@ -177,9 +204,16 @@ int main(int argc, char** argv) {
 
     auto kern = baseline ? baseline_kernel : collective_kernel;
     if (N > 8) CUDA_CHECK(cudaFuncSetAttribute(kern, cudaFuncAttributeNonPortableClusterSizeAllowed, 1));
+    int optin = 0;
+    CUDA_CHECK(cudaDeviceGetAttribute(&optin, cudaDevAttrMaxSharedMemoryPerBlockOptin, 0));
+    if (kSmemBytes > (size_t)optin)
+        hb::die("CollectiveSmem needs " + std::to_string(kSmemBytes) + " B, the device allows " + std::to_string(optin));
+    CUDA_CHECK(cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)kSmemBytes));
+    std::printf("dynamic shared memory per CTA: %zu B (device opt-in limit %d B)\n", kSmemBytes, optin);
     cudaLaunchConfig_t occ_cfg{};
     occ_cfg.gridDim = dim3(N);
     occ_cfg.blockDim = dim3(threads);
+    occ_cfg.dynamicSmemBytes = kSmemBytes;
     int max_active = -1;
     CUDA_CHECK(cudaOccupancyMaxActiveClusters(&max_active, kern, &occ_cfg));
     std::printf("cudaOccupancyMaxActiveClusters = %d\n", max_active);
@@ -233,7 +267,7 @@ int main(int argc, char** argv) {
         CUDA_CHECK(cudaMemset(d_ts, 0, h_ts.size() * sizeof(unsigned long long)));
         CUDA_CHECK(cudaMemset(d_smid, 0xff, N * sizeof(unsigned)));
         CUDA_CHECK(cudaEventRecord(e0));
-        kern<<<N, threads>>>(d_in, d_out, d_ts, d_smid);
+        kern<<<N, threads, kSmemBytes>>>(d_in, d_out, d_ts, d_smid);
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaEventRecord(e1));
 
