@@ -15,6 +15,9 @@
  *    Primitive: thread 0 does mbarrier.arrive.expect_tx on its own barrier, maps destination
  *    buffer + barrier with mapa, issues cp.async.bulk shared::cta -> shared::cluster with
  *    complete_tx; all threads spin on mbarrier parity (i ^ 1); local add; barrier.cluster per round.
+ *    Deviation: the origin adds the received buffer into `src` in place although its own outgoing
+ *    bulk copy may still be reading `src`; here the sum goes to an alternate buffer (ping-pong),
+ *    same message/barrier count.
  *
  * Source: third_party/ClusterFusion/include/dsm.cuh (Stage::LINEAR / ATTN variants), used
  * for partial QKV (3*128 halves) and partial attention output (128 halves) in the Llama kernel.
@@ -22,31 +25,36 @@
 #include "dsmem_primitives.cuh"
 using namespace dsmem;
 
+// Returns the buffer (buf or alt) that holds the result.
 template <int N, typename T, int M>
-__device__ void allreduce_shift_accumulate(T* buf, T* scratch, uint32_t bar, Stamps st) {
+__device__ T* allreduce_shift_accumulate(T* buf, T* alt, T* scratch, uint32_t bar, Stamps st) {
     static_assert(N == 4, "shipped loop bound (i < N-1) only reduces correctly for N == 4");
     static_assert((M * sizeof(T)) % 16 == 0, "bulk copy needs a multiple of 16 bytes");
     constexpr uint32_t bytes = M * sizeof(T);
     const uint32_t rank = cluster_rank();
-    const uint32_t buf_a = smem_u32(buf), scr_a = smem_u32(scratch);
+    const uint32_t scr_a = smem_u32(scratch);
+    T* cur = buf; T* other = alt;
     for (int i = 1; i < N - 1; ++i) {
         if (threadIdx.x == 0) {
             mbar_arrive_expect_tx(bar, bytes);                // arm my barrier for `bytes` incoming
             const uint32_t dst_cta = (rank + i) % N;          // shift partner
-            bulk_push(dst_cta, scr_a, buf_a, bytes, bar);     // mapa(dst)+mapa(bar), cp.async.bulk ... complete_tx
+            bulk_push(dst_cta, scr_a, smem_u32(cur), bytes, bar);   // mapa(dst)+mapa(bar), cp.async.bulk ... complete_tx
         }
         mbar_wait_parity(bar, (i ^ 1) & 1);                   // origin waits parity i^1: round 1 -> 0, round 2 -> 1
-        for (int e = threadIdx.x; e < M; e += blockDim.x) buf[e] += scratch[e];   // local reduce-add
+        for (int e = threadIdx.x; e < M; e += blockDim.x) other[e] = cur[e] + scratch[e];   // local reduce-add (ping-pong)
         fence_proxy_async_smem();                             // (added) order generic writes before next bulk read
         cluster_sync();                                       // origin: cluster.sync() ends every round
+        T* t = cur; cur = other; other = t;
         st.round(i - 1);
     }
+    return cur;
 }
 
 __global__ void __cluster_dims__(CLUSTER_N, 1, 1)
 collective_kernel(const ELEM_T* in, ELEM_T* out, unsigned long long* ts, unsigned* smid_out) {
     constexpr int N = CLUSTER_N, M = MSG_ELEMS;
     __shared__ __align__(16) ELEM_T buf[M];
+    __shared__ __align__(16) ELEM_T alt[M];
     __shared__ __align__(16) ELEM_T scratch[M];
     __shared__ __align__(8) uint64_t bar;
     const uint32_t rank = cluster_rank();
@@ -57,8 +65,8 @@ collective_kernel(const ELEM_T* in, ELEM_T* out, unsigned long long* ts, unsigne
     if (threadIdx.x == 0) { mbar_init(smem_u32(&bar), 1); fence_mbar_init(); smid_out[rank] = smid(); }   // origin: init once, count 1
     cluster_sync();
     st.mark(0);
-    allreduce_shift_accumulate<N, ELEM_T, M>(buf, scratch, smem_u32(&bar), st);
+    ELEM_T* res = allreduce_shift_accumulate<N, ELEM_T, M>(buf, alt, scratch, smem_u32(&bar), st);
     st.mark(1);
-    store_block<ELEM_T, M>(out + rank * M, buf);
+    store_block<ELEM_T, M>(out + rank * M, res);
     cluster_sync();
 }
