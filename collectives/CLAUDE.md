@@ -14,7 +14,7 @@ Only `collectives/` is in scope: every `<op>__<alg>__<src>.cu` must (1) compile 
 (2) produce correct results for every legal configuration, (3) never deadlock or race, and (4) be
 benchmarked for latency and bandwidth per `docs/EXPERIMENTS.md`, with figures in
 `analysis/dsmem_collectives.ipynb`. **The 29 algorithm files are modifiable:** they are untested
-implementations, and C2–C5 exist to find and fix their bugs (see *Workflow* item 3). `kernels/` and
+implementations, and C2–C4 exist to find and fix their bugs (see *Workflow* item 3). `kernels/` and
 `third_party/` are reference material and are not compiled here. This study also owns what was planned as experiment 17 of h100-microbench
 (`h100-microbench/docs/experiments/17__dsmem_collectives.md`, reference input for task C7).
 
@@ -89,8 +89,12 @@ Follow `../CLAUDE.md` ("Starting a new conversation"): the task is the first row
 
 1. C1: record the tooling above, vendor the microbench harness (`../docs/REUSE.md`), build the harness
    described in `docs/TESTING.md` under `collectives/harness/`, and the compile matrix.
-2. C2–C3: correctness matrix; C4: deadlock/race checks and sanity checks; C5: performance sweep from
-   `docs/EXPERIMENTS.md`; C6: the notebook; C7 (optional): the extensions taken over from microbench 17.
+2. Run order after C1: C2–C3 correctness matrix; C5 performance sweep from `docs/EXPERIMENTS.md` plus the
+   traffic model; C6 the notebook (the **preliminary** result — a project-internal status only, never written
+   in the notebook); C4 sanitizers and the TESTING §4–6 sanity checks on the sweep's data, with the fix + redo
+   loop (fix the file → re-run its correctness and sweep configurations → re-execute the notebook) that makes
+   the result final; C7 (optional) the extensions taken over from microbench 17. IDs are historical; the
+   `ROADMAP.md` status table lists the rows in run order.
 3. The algorithm files are modifiable and are expected to need fixes: change a file whenever correctness,
    sanitizer, deadlock, traffic or performance-sanity checks show it is wrong (or when the user asks).
    Log every change in the *Change log* below (file, failing configuration or reason, root cause, what

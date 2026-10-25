@@ -9,24 +9,30 @@ Reusable code: `../docs/REUSE.md`. Design: `docs/TESTING.md` (correctness) and `
 Status values: `todo` · `in progress` (current conversation) · `in review` (committed locally, waiting for the
 user's review, not pushed) · `done` (approved and pushed). Update the row **before** the task's commit;
 "Key results" records what later tasks consume (numbers, file paths, decisions).
+Rows are listed in **run order**; the IDs are historical (C4 runs after C6, see *Dependencies*).
 
 | ID | Task | Status | Key results for later tasks |
 |---|---|---|---|
 | C1 | Environment, vendored harness, build matrix, GPU smoke test | done | **Prereq:** microbench GPU-3 bring-up done in this conversation (commit `89ff996`, row `in review` there): lock **1635 MHz** on GPU 3; GPU-3 map = run `2026-10-25T19:56:47.043+00:00` of `03__sm_gpc_topology__map.csv`, identical to GPU 2 (SMs 124–131 only in CS ≤ 2; partition columns empty). **Harness:** `harness/main.cu` (modes correctness/perf/ncu, `--baseline`), `harness/driver.py` (build/run/summary), `harness/trap_cs16.cu`, `harness/ncu_discovery.sh`; vendored `common/h100mb/` (microbench `14875a5`, path fix only). **Launch path:** dynamic smem `<<<N, 256, sizeof(CollectiveSmem)>>>` after `cudaFuncAttributeMaxDynamicSharedMemorySize`; compile-time `__cluster_dims__(16)` compiles; plain `<<<N,256>>>` works once `NonPortableClusterSizeAllowed` is set (fails before), `cudaLaunchKernelEx` with an equal cluster attribute is also accepted; `cudaOccupancyMaxActiveClusters` works without the attribute (CS 4/8/16 at 256 thr, small smem: 248/124/58). Harness self-test (microbench 01 T1–T7) passes on the vendored copy. ~~First build (static shared memory, 48 KiB limit; `results/build_matrix.csv`): 900 configurations, 694 OK, 81 SKIP:static_assert, 125 SKIP:smem, 0 ERROR.~~ Superseded by the **C1 revision (2026-10-25, user request): all 29 files use dynamic shared memory up to 227 KiB per CTA** (`struct CollectiveSmem`, CLAUDE.md change log) and the docs declare the algorithm files modifiable. **Build matrix v2** (`results/build_matrix_v2.csv`; grid M ∈ {16,64,256,1024,4096,16384} = 1080 configurations plus `M_max` search points): **0 ERROR**; latest status 1181 OK, 118 SKIP:static_assert, 106 SKIP:smem. **Runnable set for C2/C3 = grid OK + the largest OK `M_max` per (file, N, T) = 1043 configurations**: allreduce 284 float + 284 int (C2); allgather 168, alltoall 119, reducescatter 94 float + 94 int (C3); `driver.py run` selects exactly these (138 lower `M_max` search builds are kept in the matrix but not run). `M_max` reaches 226–227 KiB for every (file, N, T) except algorithmic caps: shift_accumulate_atomic M ≤ 1024 (N = 2/4), shift_accumulate_bulk N = 4 only, fa4 N = 2 only; e.g. allreduce ring N = 16 → M = 54 656, hpcops → 58 112, alltoall direct push N = 16 → 1 812, allgather N = 16 → 3 416–3 628 (`driver.py summary`). Conversion check: for the 694 configurations that built statically, the dynamic size equals the static one (280) or +8 B struct padding (404); the 10 others are 2d_mesh N = 2, whose unused `col_slots` (0.5·M) the static build had dropped (TESTING §1). 97 configurations that were SKIP:smem now build. Skip formulas per file: TESTING §1. **Smoke** (N = 4, fa4 N = 2; M = 256 float; pattern A; 5 reps; lock 1635): **29/29 PASS**, 0 deadlocks, 0 clock-flagged launches, ranks always on distinct SMs (CS 4 → SMs 0/1/16/17 = G0, CS 2 → 124/125); median latency 224 ns (fa4 N = 2) … 2.75 µs (ring allreduce). **Smoke after the revision** (same small configuration + the largest-smem OK configuration of every file, up to 227 KiB/CTA at N = 16; 5 reps): **57/58 PASS**, 0 deadlocks, 0 clock-flagged; **FAIL: `allreduce__shift_accumulate_atomic__clusterfusion` N = 4, M = 1024, int** (5/5 reps): thread e owns element e (`if (threadIdx.x < M)`) and the harness runs 256 threads, so elements 256…1023 are never reduced — a genuine bug (the `M ≤ 1024` assert assumes 1024 threads), independent of the shared-memory change, left for C2. **ncu:** DSMEM payload = `l1tex__m_l1tex2xbar_write_bytes_mem_dshared.sum` = `l1tex__m_xbar2l1tex_read_bytes_mem_dshared.sum` = exactly the payload for bulk push (`_op_tma_st`), store push (`_op_st`) and pull (`_op_ld`); baseline 0; LSU `t_*` metrics miss bulk copies; `lts__t_sectors_srcunit_tex` counts the kernel's global I/O (not ≈ 0) — EXPERIMENTS §1. **Note:** 4 misaligned rows from a first driver test (extra empty mandatory field) are kept in `results/build_matrix__c1_driver_test_misaligned_2026-10-25.csv`, not used. GPU time ≈ 20 min. |
 | C2 | Correctness: AllReduce (12 files) | done | **All 12 AllReduce files pass every runnable configuration** (TESTING §6 correctness; sanitizers in C4): **580 configurations** (290 float + 290 int = grid M ∈ {16…16384} + the largest M that fits, up to 227 KiB/CTA) × 3 fresh processes × 200 reps, pattern A bit-exact for float and int (580/580), pattern B float within tolerance (290/290; max error ≤ 1.64 % of `1e-5·(1+|ref|)·ceil(log2 N)`, worst atomic_all_push 6.6e-7 rel); 0 deadlocks, 0 clock-flagged launches (lock 1635 MHz), ranks always on distinct SMs. Per file (configurations per type): 2d_mesh, atomic_all_push, one_shot_pull, hpcops, recursive_doubling, reduce_bcast_binomial 28; rabenseifner, ring, two_shot_push 26 (M = 16 illegal at N ≥ 8); direct_replicated_push 23; shift_accumulate_atomic 14 (N = 2/4); shift_accumulate_bulk 7 (N = 4). `atomic_all_push` (order-nondeterministic float atomics) is exact under pattern A as required. **One fix:** `allreduce__shift_accumulate_atomic__clusterfusion` failed at M = 1024 (N = 2/4, 600/600 reps; elements ≥ blockDim = 256 never reduced): threads now stride over M with a `snap[M]` snapshot buffer; schedule, atomics and barriers unchanged; its `M ≤ 1024` cap is gone (M_max 29 056) — CLAUDE.md change log. Data (local): `results/correctness.csv` (119 MB, 532 036 rows incl. C1 smoke rows and the 12 superseded failing processes), driver runs `2026-10-25T20:40:43.672` (pattern A, 1704 processes: 1692 PASS + 12 FAIL before the fix), `21:19:57.737` (fixed file re-run, 84/84), `21:21:23.741` (pattern B, 870/870); triage `harness/correctness_report.py` → `results/correctness_summary__2026-10-25T163638.399-0500.csv`. `driver.py run --ops <op>` filters by collective (for C3). GPU time ≈ 55 min. |
 | C3 | Correctness: AllGather (7), ReduceScatter (4), AlltoAll (6) | done | **All 17 files pass every runnable configuration, no fix needed** (TESTING §6 correctness; sanitizers in C4): **475 configurations** (381 float + 94 int; grid M ∈ {16…16384} + the largest M that fits 227 KiB/CTA) × 3 fresh processes × 200 reps; pattern A exact (475/475), pattern B float (381/381): AllGather/AlltoAll bit-exact (172 200 pattern-B rows, max_abs_err 0 in all), ReduceScatter within tolerance (max ≤ 1.29 % of `1e-5·(1+|ref|)·ceil(log2 N)`); 0 deadlocks, 0 clock-flagged launches (lock 1635 MHz), ranks always on distinct SMs. Per file (configurations per type): allgather ×7 24 each; alltoall bruck 24, direct_pull/direct_push/pairwise_xor/shift 22, pairwise_exchange (fa4, N = 2) 7; reducescatter direct_pull 24, direct_push 22, recursive_halving 24, ring 24 (float = int). Data (local): `results/correctness.csv` now 227 MB / 1 045 636 rows (C1 smoke + C2 + C3); driver runs `2026-10-25T21:39:19.912` (pattern A, 1425/1425 PASS), `22:04:19.984` (pattern B, 1143/1143 PASS); summary `results/correctness_summary__2026-10-25T172440.353-0500.csv`. GPU time ≈ 45 min. |
-| C4 | Sanitizers, deadlock/race checks, placement and traffic sanity | todo | |
-| C5 | Performance sweep (stamps, host times, ncu counters) | todo | |
-| C6 | Notebook and final report | todo | |
+| C5 | Performance sweep (stamps, host times, ncu counters) and traffic model | todo | |
+| C6 | Notebook and report (preliminary result until C4 closes) | todo | |
+| C4 | Sanitizers, deadlock/race checks, stamp/placement/traffic/flakiness checks on the sweep data; fix + redo loop | todo | |
 | C7 | *Optional* — extensions taken over from h100-microbench experiment 17 | todo | |
 
 ## Dependencies
 ```
 h100-microbench "GPU-3 bring-up" row (GPU lock value + GPU-3 SM→GPC map) ─┐  (needed for any GPU run)
-C1 ─► C2 ─┬─► C4 ─► C5 ─► C6 ─► (C7, only if the user asks)
-    └► C3 ─┘
+C1 ─► C2 ─┬─► C5 ─► C6 ─► C4 ─► (C7, only if the user asks)
+    └► C3 ─┘              ▲      │
+                          └──────┘  a C4 finding: fix the file, re-run its C2/C3 correctness and its C5
+                                    configurations, re-execute the C6 notebook
 ```
-C2 and C3 are independent of each other (either order). C1's build-only steps can run before the microbench
+C2 and C3 are independent of each other (either order). The sweep (C5) and the notebook (C6) start as soon as
+correctness (C2, C3) holds; the C6 notebook is the **preliminary** result, and C4 (sanitizers and the
+TESTING §4–6 sanity checks, run largely on C5's data) is the gate that turns it into the final one. This is a
+project-internal status only: the notebook itself never says "preliminary" or mentions C4. C1's build-only steps can run before the microbench
 bring-up is done; its GPU smoke step cannot. This roadmap does not depend on `roofline/`.
 
 ## Shared facts for every task
@@ -142,47 +148,14 @@ exact. Note the smem-heavy layouts (`N·M`, `2·N·M`): their large-N/large-M co
 
 ---
 
-## C4 — Sanitizers, deadlock/race checks, placement and traffic sanity
-**Goal.** Close `docs/TESTING.md` §6: no sanitizer error, no watchdog expiry, placement and stamps sane,
-measured DSMEM traffic matches the README model within 10 %.
+## C5 — Performance sweep and traffic model
+**Goal.** `docs/EXPERIMENTS.md` §3–5: latency and bandwidth of every legal configuration, ncu counters, and the
+per-rank traffic model that C6 (figures 5–6) and C4 (traffic check) use.
 
 **Prerequisites.** C2 and C3 `done`.
 
-**Read first.** `docs/TESTING.md` §4–6; `docs/EXPERIMENTS.md` §1 and §4 (metric names from C1);
-`../docs/ENVIRONMENT.md` §4 (ncu rules); `README.md` "Total DSMEM bytes per CTA" column.
-
-**Steps.**
-1. `compute-sanitizer --tool memcheck` on every passing configuration (use `--reps 3`; sanitizers are slow);
-   `racecheck` and `synccheck` where they support cluster-scope barriers on this version — record
-   "unsupported" with the tool's message otherwise. Run under `tools/run --profile` only if the tool needs
-   it; otherwise plain GPU mode.
-2. `CUDA_LAUNCH_BLOCKING=1` once per file.
-3. Stamp/placement checks over all C2/C3 data: `ts[1] > ts[0]`, monotone round stamps, N distinct SMs all
-   inside one GPC of the **GPU-3** SM→GPC map (path in `../docs/ENVIRONMENT.md` §1).
-4. Traffic model: `harness/traffic_model.py` evaluates the README / docstring formulas per (file, N, M, T,
-   rank) → `results/model.csv` (`EXPERIMENTS.md` §5 schema, mandatory columns first).
-5. ncu traffic check, one mid-size configuration per file (N = 8 where legal, M = 1024): DSMEM bytes
-   (kernel-wide `.sum`, plus `.max/.avg` as the hot-spot factor), compared with the model; subtract a
-   same-grid baseline (an all-exit launch) as `../docs/ENVIRONMENT.md` §4 says. A mismatch > 10 % means the
-   README or the implementation is wrong: investigate and fix the wrong one (log it), do not annotate.
-   Check `lts__t_sectors_srcunit_tex.sum ≈ 0` (DSMEM never reaches L2).
-6. Flakiness: latency p90/p50 across 200 reps < 20 % under the locked clock; outliers investigated (clock
-   samples, throttle reasons, placement).
-
-**Deliverables.** `results/sanitizer.csv`, `results/model.csv`, `results/ncu_traffic.csv` (local);
-`harness/traffic_model.py`; the TESTING §6 skip list (every skipped configuration and why) in "Key results".
-
-**Done when.** TESTING §6 holds; every exception is explained. GPU time ≈ 1–2 h (sanitizers dominate).
-
----
-
-## C5 — Performance sweep
-**Goal.** `docs/EXPERIMENTS.md` §3–5: latency and bandwidth of every legal configuration, plus ncu counters.
-
-**Prerequisites.** C4 `done`.
-
-**Read first.** `docs/EXPERIMENTS.md` (all), `../docs/ENVIRONMENT.md` §4–5, C4's key results (skips, metric
-names, baseline traffic).
+**Read first.** `docs/EXPERIMENTS.md` (all), `../docs/ENVIRONMENT.md` §4–5, C1's key results (metric names,
+payload accounting, launch path), C2/C3 key results (runnable set, fixes).
 
 **Steps.**
 1. `driver.py --mode perf`: 20 warm-up + 200 timed launches per configuration, one process per configuration,
@@ -194,28 +167,38 @@ names, baseline traffic).
    1 GiB, split it per op and sweep (`stamps_<op>_s<k>.csv`) rather than reducing — every stamp is kept
    (the notebook then concatenates `stamps*.csv`; adapt its loader in C6).
 3. ncu pass (EXPERIMENTS §4, 5 replays per configuration, `--clock-control none`, metric list from §1) →
-   `results/ncu.csv`.
-4. Sanity against `../docs/REUSE.md` §3 (agent-only): e.g. a 1-round push collective at small M should sit
+   `results/ncu.csv`, including one same-grid all-exit baseline launch (`main.cu --mode ncu --baseline`) per
+   (N, dynamic smem size) so C4 can subtract the profiler's own traffic.
+4. Traffic model: `harness/traffic_model.py` evaluates the README / docstring formulas per (file, N, M, T,
+   rank) → `results/model.csv` (`EXPERIMENTS.md` §5 schema, mandatory columns first): `bytes_sent`,
+   `bytes_recv` (pulls: bytes read), `rounds`; rooted trees are uneven per rank. Also the global-I/O model
+   (`in` read, `out`/`ts`/`smid` written) that C4 compares `lts__t_sectors_srcunit_tex` against.
+5. Sanity against `../docs/REUSE.md` §3 (agent-only): e.g. a 1-round push collective at small M should sit
    near one cluster barrier + one `st.async`/bulk hand-off; latencies below one cluster barrier mean a stamp
    problem.
 
-**Deliverables.** `results/{stamps,host,ncu}.csv` (local), the sweep command lines in `CLAUDE.md` → *Tooling*.
+**Deliverables.** `results/{stamps,host,ncu,model}.csv` (local), `harness/traffic_model.py`, the sweep command
+lines in `CLAUDE.md` → *Tooling*.
 
 **Done when.** Both sweeps complete for every legal configuration (partial runs registered as partial and
-re-run); drift between sweeps reported. GPU time ≈ 2–4 h (≈ 500 configurations × 2 sweeps + ncu replays).
+re-run); drift between sweeps reported; `model.csv` covers every swept (file, N, M, T, rank). GPU time
+≈ 2–4 h.
 
 ---
 
-## C6 — Notebook and final report
+## C6 — Notebook and report (preliminary result until C4 closes)
 **Goal.** `analysis/dsmem_collectives.ipynb` executed with figures 1–6 of `docs/EXPERIMENTS.md` §6 stored in
-the file, and a written report.
+the file, and a written report. Within the project this is the **preliminary** result: C4 runs the
+remaining checks afterwards and re-executes the notebook if a fix changes any data. The notebook is written as
+a final report and never mentions that status, C4, or the checks still to come.
 
 **Prerequisites.** C5 `done`.
 
 **Steps.**
 1. Fill the notebook (it exists as a skeleton: keep its structure, adapt to the real CSV columns):
-   definitions (EXPERIMENTS §2), setup (device, clock, toolchain, run_ids used), figures 1–6, one or two
-   sentences per figure, a table of the best algorithm per (op, N, payload) for latency and for bus bandwidth.
+   definitions (EXPERIMENTS §2), setup (device, clock, toolchain, run_ids used), figures 1–6 (5 and 6 use
+   C5's `model.csv`), one or two sentences per figure, a table of the best algorithm per (op, N, payload) for
+   latency and for bus bandwidth.
 2. Write `results/summary_latency.csv` and `results/summary_bandwidth.csv` (medians, p10/p90, per-rank
    maxima) — these and the executed notebook are the only committed result files (force-add).
 3. Execute: `$TR --no-gpu -- jupyter nbconvert --execute --to notebook --inplace collectives/analysis/dsmem_collectives.ipynb`.
@@ -226,9 +209,51 @@ the file, and a written report.
 
 ---
 
+## C4 — Sanitizers, deadlock/race checks, stamp/placement/traffic/flakiness checks; fix + redo loop
+**Goal.** Close `docs/TESTING.md` §6 on the final code and data: no sanitizer error, no watchdog expiry,
+placement and stamps sane, measured DSMEM traffic within 10 % of the model, latency spread p90/p50 < 20 %.
+C4 runs **after** C5 and C6 and checks their data; it turns the preliminary C6 result into the final one.
+
+**Prerequisites.** C6 `done`.
+
+**Read first.** `docs/TESTING.md` §4–6; `docs/EXPERIMENTS.md` §1 and §4 (metric names and payload accounting
+from C1); `../docs/ENVIRONMENT.md` §4 (ncu rules); `README.md` "Total DSMEM bytes per CTA" column; C5 and C6
+key results.
+
+**Steps.**
+1. `compute-sanitizer --tool memcheck` on every passing configuration (`--reps 3`; sanitizers are slow);
+   `racecheck` and `synccheck` on a subset (every file × every legal N × {M = 256, the file's `M_max`}, float)
+   where they support cluster-scope barriers on this version — probe one configuration first and record
+   "unsupported" with the tool's message otherwise. Plain GPU mode unless a tool needs `--profile`.
+   Sanitized runs write their correctness rows to `results/correctness__<tool>.csv`, not `correctness.csv`.
+2. `CUDA_LAUNCH_BLOCKING=1` once per file.
+3. Stamp/placement checks on C5's `stamps.csv` (and the `smids` of C2/C3): `exit > entry` per rank, round
+   stamps non-decreasing (equal within the 32 ns tick is fine) and as many as the file's rounds, N distinct
+   SMs all inside one GPC of the **GPU-3** SM→GPC map (path in `../docs/ENVIRONMENT.md` §1).
+4. Traffic check from C5's `ncu.csv` against C5's `model.csv`: DSMEM bytes (kernel-wide `.sum`, plus
+   `.max/.avg` as the hot-spot factor) minus the same-grid baseline (`../docs/ENVIRONMENT.md` §4). A mismatch
+   > 10 % means the README or the implementation is wrong: investigate and fix the wrong one (log it), do not
+   annotate. `lts__t_sectors_srcunit_tex.sum` must match the global-I/O model (DSMEM never reaches L2).
+5. Flakiness from C5's stamps: latency p90/p50 across 200 reps < 20 % under the locked clock; outliers
+   investigated (clock samples, throttle reasons, placement).
+6. **Fix + redo loop.** Any finding that shows a file is wrong: fix it (CLAUDE.md → Workflow item 3, change
+   log), re-run the file's C2/C3 correctness, re-run its C5 configurations (both sweeps, ncu), re-execute the
+   C6 notebook, and re-check. Record which data were replaced (run_ids).
+
+**Deliverables.** `results/sanitizer.csv`, the checks' output (local); the TESTING §6 skip list (every skipped
+configuration and why) in "Key results"; fixes with change-log entries; the re-executed notebook if any data
+changed.
+
+**Done when.** TESTING §6 holds on the final data and every exception is explained; the notebook reflects the
+final data. GPU time ≈ 2.5–3 h (sanitizers dominate) plus any redo.
+
+---
+
 ## C7 — Optional: extensions from h100-microbench experiment 17 (start only when the user asks)
-**Goal.** Cover what `h100-microbench/docs/experiments/17__dsmem_collectives.md` planned beyond C1–C6.
+**Goal.** Cover what `h100-microbench/docs/experiments/17__dsmem_collectives.md` planned beyond C1–C6 and C4.
 Read that spec first; it is reference input, not binding.
+
+**Prerequisites.** C4 `done`.
 
 **Candidate items (agree the subset with the user in plan mode).**
 - **Broadcast**: rooted algorithms the catalogue lacks — TMA multicast from the root

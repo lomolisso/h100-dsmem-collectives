@@ -1,6 +1,7 @@
 # EXPERIMENTS.md — latency and bandwidth study of DSMEM collectives on an H100 NVL (design)
 
-Runs only after `TESTING.md` is green (roadmap task C5; figures in C6, `../ROADMAP.md`). Produces
+Runs after the correctness checks of `TESTING.md` §2–3 hold (roadmap tasks C2–C3); sweep and traffic model in
+C5, figures in C6, and the `TESTING.md` §4–5 sanity checks (C4) afterwards on this sweep's data (`../ROADMAP.md`). Produces
 `collectives/results/*.csv`, consumed by `analysis/dsmem_collectives.ipynb`. Environment, clock lock and
 ncu rules: `../../docs/ENVIRONMENT.md`.
 

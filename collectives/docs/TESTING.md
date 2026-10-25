@@ -1,6 +1,6 @@
 # TESTING.md — correctness, deadlock and sanity harness for `collectives/` (design, no code)
 
-Roadmap tasks C1 (harness, build matrix), C2–C3 (correctness, §2–3) and C4 (§4–6) implement this design
+Roadmap tasks C1 (harness, build matrix), C2–C3 (correctness, §2–3) and C4 (§4–6, after the sweep C5 and the notebook C6) implement this design
 under `collectives/harness/` (`ROADMAP.md`). Nothing here depends on the server; the server protocol is
 `../../docs/ENVIRONMENT.md`, tool versions are recorded in `CLAUDE.md` → *Tooling*. Builds run through
 `tools/run --no-gpu`, GPU runs through `tools/run --profile --lock-sm-mhz <LOCK>` on GPU 3; the vendored
@@ -87,7 +87,7 @@ Expected compile failures (record them as `SKIP:static_assert` / `SKIP:smem`, ne
   peers (missing exit `cluster_sync`), or `bulk_push` with a non-16-byte-aligned size.
 - Run with `CUDA_LAUNCH_BLOCKING=1` once per file to rule out host-side ordering effects.
 
-## 5. Sanity checks on the performance side (before the sweep)
+## 5. Sanity checks on the performance side (C4, on the sweep's data)
 
 - Stamps: every rank must have `ts[1] > ts[0]` and monotone round stamps; `smid` values must be N
   distinct SMs, all inside one GPC (ranks of one cluster never share an SM). Use the **GPU-3** SM→GPC map
@@ -104,4 +104,6 @@ Expected compile failures (record them as `SKIP:static_assert` / `SKIP:smem`, ne
 
 All 29 files × all legal configurations pass §3 pattern A bit-exactly for 200 reps × 3 processes, no
 sanitizer error, no watchdog expiry, and the §5 traffic check matches. List every configuration that was
-skipped and why. Then proceed to `docs/EXPERIMENTS.md`.
+skipped and why. Order (`../ROADMAP.md`): §2–3 (C2–C3) come first and gate the sweep (`docs/EXPERIMENTS.md`,
+C5) and the notebook (C6); §4–5 (C4) run afterwards, largely on the sweep's stamps and ncu counters. A C4
+finding means: fix the file, re-run its correctness and sweep configurations, re-execute the notebook.
