@@ -129,3 +129,12 @@ Follow `../CLAUDE.md` ("Starting a new conversation"): the task is the first row
   changed. Harness: dynamic size + opt-in attribute + `SMEM_LIMIT` static_assert; build matrix M axis extended
   with 16384 and a per-(file, N, T) `M_max` point (largest M that fits). The docs now state that the
   algorithm files are modifiable.
+- 2026-10-25 (C2) `allreduce__shift_accumulate_atomic__clusterfusion.cu`: **wrong result for M > blockDim**.
+  Failing: N = 2 and 4, M = 1024, float and int, pattern A, 600/600 reps (n_bad 1446 at N = 2, 2982 at N = 4,
+  = the elements ≥ 256 of every rank). Root cause: thread e owned element e (`if (threadIdx.x < M)`, guarded by
+  `static_assert(M <= 1024)`, i.e. it assumed blockDim ≥ M), while the harness runs 256 threads, so elements
+  256…M-1 were never reduced. Fix: threads stride over the M elements; the per-round snapshot of the running
+  value moves from one register per thread to a `snap[M]` buffer in `CollectiveSmem` (all elements snapshotted
+  before the first cluster barrier, as before). Unchanged: shift schedule, rounds (N-2, 1 for N = 2), one remote
+  `atomicAdd` per element per round, 2 cluster barriers per round. The `M <= 1024` assert is gone (shared memory
+  2M; M_max now 29 056 at N = 2/4). README row: also corrected the total for N = 2 (M·B, not 0).

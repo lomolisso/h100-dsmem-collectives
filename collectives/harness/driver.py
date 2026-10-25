@@ -4,7 +4,7 @@
 Run inside the microbench container from anywhere (it chdirs to collectives/):
   tools/run --no-gpu -- python3 collectives/harness/driver.py build [--jobs 16] [--files F ...] [--N ...] [--M ...] [--T ...] [--force] [--no-mmax]
   tools/run --profile --lock-sm-mhz <LOCK> -- python3 collectives/harness/driver.py run --mode correctness \
-        --pattern A --reps 200 --processes 3 [--smoke] [--files ...] [--N ...] [--M ...] [--T ...] [--shuffle --seed S]
+        --pattern A --reps 200 --processes 3 [--smoke] [--ops allreduce ...] [--files ...] [--N ...] [--M ...] [--T ...] [--shuffle --seed S]
   tools/run --no-gpu -- python3 collectives/harness/driver.py summary
 
 build: one binary per (file, N, M, T): N in {2,4,8,16}; M on the grid {16,64,256,1024,4096,16384} plus, per
@@ -142,7 +142,8 @@ def cfg_name(f, n, m, t):
 
 
 def selected(args, f, n, t):
-    return (not args.files or f in args.files) and (not args.N or n in args.N) and (not args.T or t in args.T)
+    return ((not args.files or f in args.files) and (not args.ops or split(f)[0] in args.ops)
+            and (not args.N or n in args.N) and (not args.T or t in args.T))
 
 
 def grid(args):
@@ -433,6 +434,7 @@ def main():
     for name in ("build", "run", "summary"):
         p = sub.add_parser(name)
         p.add_argument("--files", nargs="*")
+        p.add_argument("--ops", nargs="*", choices=sorted(OPS), help="only files of these collectives")
         p.add_argument("--N", nargs="*", type=int)
         p.add_argument("--M", nargs="*", type=int)
         p.add_argument("--T", nargs="*")

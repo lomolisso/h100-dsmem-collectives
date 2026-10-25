@@ -33,10 +33,10 @@ Expected compile failures (record them as `SKIP:static_assert` / `SKIP:smem`, ne
   with a message starting `SMEM_LIMIT` → `SKIP:smem`. Shared memory per file, in elements of T (measured,
   `smem_bytes` in `results/build_matrix_v2.csv`; struct padding adds ≤ 8 B): allreduce one-shot/atomic/reduce-bcast:
   2M; recursive doubling/shift bulk: 3M; rabenseifner: 1.5·M; ring: M + M/N; two-shot: 2M; replicated push:
-  (N+2)·M; hpcops: M; shift atomic: M; 2d mesh: 2.5/3.5/2.75/3.25·M for N = 2/4/8/16; allgather: N·M (+M);
+  (N+2)·M; hpcops: M; shift atomic: 2M (val + snap, since C2); 2d mesh: 2.5/3.5/2.75/3.25·M for N = 2/4/8/16; allgather: N·M (+M);
   reducescatter: N·M + M (recursive halving: 1.5·N·M; direct push: 2·N·M + M); alltoall: 2·N·M (Bruck: 1.5·N·M;
-  fa4: N·M + M). Extra `static_assert`: `allreduce__shift_accumulate_atomic__clusterfusion` requires M ≤ 1024
-  (one element per thread), so its larger configurations are `SKIP:static_assert`. The harness's `SMEM_LIMIT`
+  fa4: N·M + M). (`allreduce__shift_accumulate_atomic__clusterfusion` had an extra `M ≤ 1024` assert — one
+  element per thread — removed by the C2 fix; its threads now stride over M.) The harness's `SMEM_LIMIT`
   check is at namespace scope and the compiler stops there, so an over-limit configuration is `SKIP:smem` even if
   it would also violate an N/M constraint (only `alltoall__pairwise_exchange__fa4` at N ≥ 4, large M). The struct
   keeps every declared buffer, also one the algorithm does not use for some N (`allreduce__2d_mesh__generic`
