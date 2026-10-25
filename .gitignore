@@ -4,3 +4,7 @@
 *.ptx
 *.cubin
 *.fatbin
+
+# build and measurement outputs of the collectives study
+collectives/build/
+collectives/results/
