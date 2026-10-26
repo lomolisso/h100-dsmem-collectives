@@ -9,7 +9,7 @@ scope_operator:
     s16k_causal: {seqlen: 16384, heads: 16, head_dim: 128, batch: 2, causal: 1}
     s16k_full:   {seqlen: 16384, heads: 16, head_dim: 128, batch: 2, causal: 0}
   flops: "2.5 * 4 * seqlen*seqlen * head_dim * heads * batch / (2 if causal else 1)"
-  min_hbm_bytes: "2 * batch*heads*seqlen*head_dim * 9"
+  min_hbm_bytes: "2 * batch*heads*seqlen*head_dim * 8 + 4 * batch*heads*seqlen"   # Q K V O dO read, dQ dK dV written (bf16), LSE (fp32); R8 (was 9 tensors)
   validate: {reference: "n/a (reported)", tolerance: "n/a"}
   variants:
     - id: one_cta
@@ -29,9 +29,41 @@ scope_operator:
 scope_layer: null
 measure: null
 reported:
-  two_cta: {throughput: null, flops: null, hbm_bytes: null, source: "FA4 paper Fig. 6 (backward TFLOPS, B200, hd 128) - fill the deterministic/non-deterministic 2-CTA bars at seqlen 16384; traffic model Table 3 (2688 smem cycles)"}
-  one_cta: {throughput: null, flops: null, hbm_bytes: null, source: "FA4 paper Fig. 7 1-CTA deterministic bars; Table 3 (3328 smem cycles)"}
+  two_cta:
+    - {throughput: 1.457e+15, flops: 10995116277760, hbm_bytes: 1075838976, shape: s16k_full,
+       source: "arXiv 2603.05451v1 p.16 Fig. 6 left (non-causal, hd 128), FA4 bar at 16K: printed label 1457 TFLOPS (exact, rounded to 1 TFLOPS)"}
+    - {throughput: 1.402e+15, flops: 5497558138880, hbm_bytes: 1075838976, shape: s16k_causal,
+       source: "arXiv 2603.05451v1 p.16 Fig. 6 right (causal, hd 128), FA4 bar at 16K: printed label 1402 TFLOPS (exact, rounded to 1 TFLOPS)"}
+  one_cta:
+    - {throughput: null, flops: 10995116277760, hbm_bytes: 1075838976, shape: s16k_full,
+       source: "not reported: the paper gives no measured 1-CTA backward throughput (see notes)"}
+    - {throughput: null, flops: 5497558138880, hbm_bytes: 1075838976, shape: s16k_causal,
+       source: "not reported: the paper gives no measured 1-CTA backward throughput (see notes)"}
 notes: >
   Blackwell-only (tcgen05, TMEM, cta_group::2). Plotted as 'reported (B200)' stars from the paper's numbers,
-  clearly separated from H100 measurements; the agent fills `reported` from the PDF (hollow if only
-  relative numbers are available).
+  clearly separated from H100 measurements.
+  `reported` structure: per variant a list with one entry per shape ({throughput FLOP/s, flops and hbm_bytes =
+  the manifest formulas evaluated at that shape, shape id, source}); throughput null = not reported.
+  Source: FlashAttention-4 paper, arXiv 2603.05451v1 (only version; PDF https://arxiv.org/pdf/2603.05451, 20 pages).
+  Benchmark setting (Sec. 5, p.15): BF16, sequence lengths 1k..32k with batch chosen so that batch*seqlen = 32k
+  tokens, hidden 2048, head dim 128 -> 16 heads; seqlen 16384 -> batch 2, heads 16 = shapes s16k_full/s16k_causal.
+  Timing: 5 warm-up runs, mean of 10 (App. A.1). GPU: figures and Sec. 5 say B200; App. A.1 says
+  "B100 180GB SXM6 (1000W)" (inconsistency in the paper; labelled B200 here as in the figures).
+  FLOP convention (Sec. 5, p.15): forward 4*seqlen^2*head_dim*heads (per batch element), halved for causal;
+  backward = 2.5 x forward (5 vs 2 matmuls, recomputation). The manifest `flops` (x batch) is exactly this
+  convention, so the paper's TFLOPS and our `flops` are consistent; unchanged.
+  Which kernel: Fig. 6 shows one FA4 series; Sec. 5.2 attributes its gains to "our 2-CTA backward pass", and the
+  pinned flash-attention (interface.py, SM100 bwd) selects 2-CTA for head_dim >= 128 unless disabled, so Fig. 6
+  FA4 = the 2-CTA (DSMEM dS-exchange) kernel. Other Fig. 6 values at 16K (labels): non-causal FA2 381, cuDNN
+  9.13.0 1212, cuDNN 9.19.1.2 1280; causal FA2 341, cuDNN 9.13.0 1085, cuDNN 9.19.1 1293 TFLOPS.
+  1-CTA: no measured number in the paper. Figs. 7 (p.16, causal) and 8 (p.20, non-causal) are the deterministic
+  backward (semaphore-serialised dQ) scheduling ablations, not 1-CTA vs 2-CTA (and with the pinned code the
+  deterministic hd-128 backward is also 2-CTA); the old pointer to "Fig. 7 1-CTA bars" was wrong. 16384 labels:
+  causal SPT 940 / reverse-mblock LPT 810 / naive LPT 740 / naive 410; non-causal swizzle 860 / naive 840 TFLOPS.
+  The only quantitative 1-CTA statement: deterministic reaches "up to 75% the speed of the nondeterministic
+  backward pass of the 1-CTA backward pass" (Sec. 5.2) -> implies 1-CTA non-deterministic >= 940/0.75 = 1253
+  (causal) and >= 860/0.75 = 1147 TFLOPS (non-causal) at 16K, an inferred lower bound, not plotted.
+  Table 3 (p.11) is a per-tile cycle model, not a measurement: total smem 3328 (1-CTA, M=128) vs 2688 cycles
+  (2-CTA, M=256), MMA 2560, exp 1024; smem-bound ratio 1.24x. Scaling the 2-CTA measurement by it would give
+  1177 / 1132 TFLOPS for 1-CTA, which contradicts the causal lower bound above, so no 1-CTA marker is derived.
+  No H100 numbers for this kernel in the paper (FA3 "does not run on B200"; H100 appears only in background).

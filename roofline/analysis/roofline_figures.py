@@ -222,8 +222,20 @@ def table_setup(C=None, P=None):
     rows = {"device": f"{r.gpu_name}, {int(r.sm_count)} SMs (GPU 3)", "driver / CUDA": f"{r.driver_version} / {r.cuda_version}",
             "SM clock": f"locked at {lock_mhz(C)} MHz for every timed and ncu run; memory clock {int(r.mem_clock_mhz)} MHz",
             "ceilings run": str(C["run_id"].iloc[-1])}
+    rows["toolchain"] = ("image h100-roofline:cuda12.9.1-83734cedf58e (CUDA 12.9.1, nvcc 12.9.86, Nsight Compute 2025.2.1, "
+                         "Nsight Systems 2025.1.3, PyTorch 2.11.0+cu129, Triton 3.6.0, flashinfer 0.7.2.post1)")
+    rows["timing"] = ("kernel durations from nsys (20 warm-up + 100 iterations, L2 flushed before each); bytes and "
+                      "instruction counts from ncu (--clock-control none --cache-control all)")
     if P is not None and len(P):
         rows["points rows"] = f"{len(P)} ({(P.rep >= 0).sum()} timed reps, {(P.rep == -1).sum()} counter rows)"
+        rows["clock-flagged timed reps"] = f"{int((P[P.rep >= 0].clock_bad == 1).sum())}"
+    try:
+        r = pd.read_csv(os.path.join(RES, "roofline__runs.csv"))
+        st = r.groupby("run_id").status.agg(set)
+        rows["registered runs"] = (f"{len(st)} ({sum('complete' in x for x in st)} complete); first "
+                                   f"{r.run_id.min()}, last {r.run_id.max()}")
+    except FileNotFoundError:
+        pass
     return pd.DataFrame({"": rows}).style
 
 
@@ -413,3 +425,153 @@ def fig_hierarchical(L, workload, shape, save=None):
     fig.suptitle(f"{short_name(workload)}, {shape} (a level with no bytes is drawn at the right edge)", fontsize=9)
     fig.tight_layout()
     _show(fig, save)
+
+
+# ---------------------------------------------------------------- all workloads (R8)
+MECHANISM = {"clusterfusion_rmsnorm": "more SMs per row", "credit": "fewer HBM bytes (row read once)", "dak_gemm_multicast": "TMA multicast",
+             "deepgemm_fp8_gemm_multicast": "TMA multicast", "hpcops_topk_cluster8": "more SMs per row",
+             "clusterfusion": "kernel fusion"}
+MECH_COLOR = {"fewer HBM bytes (row read once)": "C0", "TMA multicast": "C1", "more SMs per row": "C2",
+              "kernel fusion": "C3"}
+OVERVIEW_SHAPES = {"dak_gemm_multicast": "llama_qo_t1024", "deepgemm_fp8_gemm_multicast": "m4096_n4096_k7168",
+                   "hpcops_topk_cluster8": "m8_n240k", "clusterfusion_llama2_7b_decoder": "s4k",
+                   "clusterfusion_deepseek_v2_lite_mla": "s4k", "clusterfusion_rmsnorm": "s0"}
+
+
+def mechanism(w):
+    for k, v in MECHANISM.items():
+        if w.startswith(k):
+            return v
+    return "other"
+
+
+def reported(M):
+    """Rows of the `reported` blocks of runnable: false manifests (list per variant; throughput null = not reported)."""
+    rows = []
+    for w, m in M.items():
+        for vid, items in (m.get("reported") or {}).items():
+            for it in items if isinstance(items, list) else [items]:
+                if it and it.get("throughput"):
+                    rows.append({"workload": w, "variant_id": vid, "shape_id": it.get("shape"),
+                                 "throughput": float(it["throughput"]), "ai_hbm": float(it["flops"]) / float(it["hbm_bytes"]),
+                                 "source": it.get("source", "")})
+    return pd.DataFrame(rows)
+
+
+def fig_overview(L, save=None):
+    """Classic roofline of every workload at one shape (CREDIT: n64k): non-DSMEM (grey) -> DSMEM (coloured by how the
+    DSMEM version differs). Right: the FA4 numbers reported for B200 by the paper (not comparable with the H100 roofs)."""
+    C, B, M = L["C"], L["markers"], L["M"]
+    B = B[B.scope == "operator"]
+    sel = [(w, OVERVIEW_SHAPES.get(w, "n64k")) for w in M if M[w].get("runnable") is not False]
+    fig, (ax, ax2) = plt.subplots(1, 2, figsize=(12, 5.2), gridspec_kw={"width_ratios": [3.2, 1]})
+    hbm = float(C.loc["hbm_read_bw", "value"])
+    x = np.logspace(-2, 4, 300)
+    for name, label in [("fp8_tc_peak", "FP8 tensor"), ("fp16_tc_peak", "FP16/BF16 tensor"), ("fp32_peak", "FP32"),
+                        ("int32_peak", "INT32")]:
+        v = float(C.loc[name, "value"])
+        ax.plot(x, np.minimum(v, hbm * x), color="0.25", lw=1.1)
+        ax.text(9e3, v * 1.12, f"{label} {v / 1e12:.0f} T/s", fontsize=7, ha="right")
+        pl = name.replace("_peak", "_power_limited")
+        if pl in C.index:
+            ax.plot(x, np.minimum(float(C.loc[pl, "value"]), hbm * x), color="0.25", lw=.8, ls="--")
+    ax.text(0.012, hbm * 0.012 * 1.4, f"HBM {hbm / 1e12:.2f} TB/s", fontsize=7, rotation=33)
+    seen = set()
+    for w, s in sel:
+        g = B[(B.workload == w) & (B.shape_id == s)].set_index("role")
+        if not {"non_dsmem", "dsmem"} <= set(g.index):
+            continue
+        a, b = g.loc["non_dsmem"], g.loc["dsmem"]
+        mech = mechanism(w)
+        ax.annotate("", xy=(b.ai_hbm, b.throughput), xytext=(a.ai_hbm, a.throughput),
+                    arrowprops=dict(arrowstyle="->", color="0.55", lw=.8))
+        ax.scatter(a.ai_hbm, a.throughput, color="0.5", s=22, zorder=3, label="non-DSMEM" if "n" not in seen else None)
+        seen.add("n")
+        ax.scatter(b.ai_hbm, b.throughput, color=MECH_COLOR.get(mech, "k"), marker="^", s=40, zorder=4,
+                   label=f"DSMEM: {mech}" if mech not in seen else None)
+        seen.add(mech)
+        ax.annotate(abbr(w), (b.ai_hbm, b.throughput), xytext=(4, -9), textcoords="offset points", fontsize=7)
+    ax.set(xscale="log", yscale="log", xlim=(1e-2, 1e4), ylim=(1e10, 4e15), xlabel="work per HBM byte",
+           ylabel="throughput (work/s)", title="H100 NVL, 1635 MHz, measured (operator scope)")
+    ax.legend(fontsize=7, loc="upper left")
+    ax.grid(True, which="major", alpha=.3)
+    R = reported(M)
+    for i, r in enumerate(R.itertuples()):
+        ax2.scatter(r.ai_hbm, r.throughput, marker="*", s=140, color="C4")
+        lab = {"s16k_full": "non-causal", "s16k_causal": "causal"}.get(r.shape_id, r.shape_id)
+        ax2.annotate(f"FA4 bwd {r.variant_id.replace('_', '-')}, {lab}\n{r.throughput / 1e12:.0f} TFLOP/s", (r.ai_hbm, r.throughput),
+                     xytext=(-60, 10 - 30 * i),
+                     textcoords="offset points", fontsize=7)
+    ax2.set(xscale="log", yscale="log", xlim=(1e2, 1e5), ylim=(1e14, 1e16), xlabel="FLOP per HBM byte (compulsory)",
+            title="reported (B200, FA4 paper)")
+    ax2.grid(True, which="major", alpha=.3)
+    import textwrap
+    key = ", ".join(f"{abbr(w)} = {short_name(w)} ({s})" for w, s in sel)
+    fig.suptitle(textwrap.fill(key, 150), fontsize=7)
+    fig.tight_layout()
+    _show(fig, save)
+
+
+def all_pairs(L):
+    T = pairs(L["markers"])
+    T = T.dropna(subset=["non_dsmem.time_ns", "dsmem.time_ns"]).copy()
+    T["speedup"] = T["non_dsmem.time_ns"] / T["dsmem.time_ns"]
+    T["hbm_ratio"] = T["dsmem.hbm_bytes"] / T["non_dsmem.hbm_bytes"]
+    T["dsmem_per_hbm"] = T["dsmem.dsmem_bytes"] / T["dsmem.hbm_bytes"]
+    T["mechanism"] = T.workload.map(mechanism)
+    return T
+
+
+def fig_speedup_vs_bytes(L, save=None):
+    """Every measured pair (operator scope, every shape): DSMEM / non-DSMEM time against HBM-byte ratio, coloured by
+    how the DSMEM version differs. Diagonal: time proportional to HBM bytes."""
+    T = all_pairs(L)
+    fig, ax = plt.subplots(figsize=(6.5, 5))
+    for mech, g in T.groupby("mechanism"):
+        ax.scatter(g.hbm_ratio, 1 / g.speedup, color=MECH_COLOR.get(mech, "k"), s=30, label=mech, zorder=3)
+    v = np.linspace(0.3, 1.2, 10)
+    ax.plot(v, v, color="0.6", ls="--", lw=1)
+    ax.axhline(1, color="0.75", lw=1)
+    ax.set(xlabel="HBM bytes, DSMEM / non-DSMEM", ylabel="time, DSMEM / non-DSMEM", xlim=(0.3, 1.15), yscale="log",
+           ylim=(0.5, 2.0))
+    ax.set_yticks([0.5, 0.6, 0.7, 0.8, 1, 1.25, 1.5, 2])
+    ax.yaxis.set_major_formatter(plt.matplotlib.ticker.FormatStrFormatter("%.2f"))
+    ax.yaxis.set_minor_formatter(plt.matplotlib.ticker.NullFormatter())
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=.3)
+    _show(fig, save)
+
+
+def table_summary(L):
+    T = all_pairs(L)
+    g = T.groupby("workload", sort=False)
+    out = pd.DataFrame({
+        "how DSMEM is used": g.mechanism.first(),
+        "shapes": g.size(),
+        "speedup min": g.speedup.min(), "speedup max": g.speedup.max(),
+        "HBM bytes ratio min": g.hbm_ratio.min(), "HBM bytes ratio max": g.hbm_ratio.max(),
+        "DSMEM bytes per HBM byte (max)": g.dsmem_per_hbm.max(),
+    })
+    out.index = out.index.map(short_name)
+    return out.style.format({c: "{:.2f}" for c in out.columns if c not in ("how DSMEM is used", "shapes")} |
+                            {"DSMEM bytes per HBM byte (max)": "{:.3f}"})
+
+
+def sol_check(L=None):
+    """Latest complete row per configuration of results/sol_crosscheck.csv (harness/sol_crosscheck.py: ncu's
+    SpeedOfLight roofline sections vs our point)."""
+    s = pd.read_csv(os.path.join(RES, "sol_crosscheck.csv"))
+    s = s[s.status == "complete"]
+    return s.groupby(["workload", "variant_id", "shape_id", "cluster_size"], dropna=False).tail(1)
+
+
+def table_sol_check(L=None):
+    """ncu / ours for throughput and DRAM intensity (the 10 % criterion of DESIGN §3.5), with the decomposition
+    throughput = work x time and DRAM intensity = work / bytes."""
+    s = sol_check(L)
+    s = s[s.ncu_point != "none"]
+    t = s.assign(workload=s.workload.map(short_name)).set_index(["workload", "shape_id", "role"])[
+        ["r_throughput", "r_ai_dram", "r_work", "r_time", "r_dram_bytes"]]
+    t.columns = ["throughput", "DRAM intensity", "work", "time (nsys / ncu)", "DRAM bytes"]
+    return t.sort_index().style.format("{:.2f}").map(
+        lambda v: "color: #b00" if isinstance(v, float) and abs(v - 1) > 0.10 else "", subset=["throughput", "DRAM intensity"])

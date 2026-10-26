@@ -1,9 +1,10 @@
 # roofline/ — where the DSMEM workloads sit on the H100 NVL roofline
 
 Design and registry for a roofline study (TPUv1-paper style) with two markers per workload: the DSMEM
-version and its non-DSMEM counterpart. Nothing here has been run; `CLAUDE.md` briefs the agents that
-run it on the shared H100 NVL server (GPU 3) and `ROADMAP.md` splits the work into tasks R0–R8,
-run in order in a single conversation.
+version and its non-DSMEM counterpart, measured on one H100 NVL (GPU 3, SM clock locked at 1635 MHz).
+Results: `analysis/roofline.ipynb` (executed, figures stored), `results/ceilings.csv` and `results/points.csv`;
+`ROADMAP.md` records tasks R0–R8 (run in one conversation) and their key results, `CLAUDE.md` the protocol and the
+change log of every fix made to an artifact.
 
 | Path | Content |
 |---|---|
@@ -15,7 +16,9 @@ run in order in a single conversation.
 | `workloads/*.yaml` | One manifest per workload (15 initial) — the only thing to add for a new workload |
 | `analysis/roofline.ipynb` | Reads every manifest + `results/ceilings.csv` + `results/points.csv`; draws the classic and hierarchical rooflines and per-workload bars |
 | `patches/` | `git diff` patches applied to submodules to obtain a variant (referenced by manifests) |
-| `results/` | git-ignored measurement outputs |
+| `harness/` | `run_manifest.py` (build → validate → time (nsys) → ncu → `points.csv`), ceiling microbenchmarks (`ceilings/`), per-workload wrappers (`workloads/`), ncu roofline cross-check |
+| `docker/`, `tools/` | derived image (`build_image.sh`) and the `tools/run` wrapper |
+| `results/` | git-ignored measurement outputs, except `ceilings.csv` and `points.csv` |
 
 ## Adding a workload pair in three steps
 
