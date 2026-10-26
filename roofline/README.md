@@ -2,11 +2,12 @@
 
 Design and registry for a roofline study (TPUv1-paper style) with two markers per workload: the DSMEM
 version and its non-DSMEM counterpart. Nothing here has been run; `CLAUDE.md` briefs the agents that
-run it on the shared H100 NVL server (GPU 3) and `ROADMAP.md` splits the work into tasks R0–R8.
+run it on the shared H100 NVL server (GPU 3) and `ROADMAP.md` splits the work into tasks R0–R8,
+run in order in a single conversation.
 
 | Path | Content |
 |---|---|
-| `CLAUDE.md` | Agent brief: server protocol (from `../docs/ENVIRONMENT.md`), workflow and rules |
+| `CLAUDE.md` | Agent brief: one-conversation protocol, server protocol (from `../docs/ENVIRONMENT.md`), workflow and rules |
 | `ROADMAP.md` | Task status table and one card per task (R0 environment, R1 ceilings, R2 runner + CREDIT, R3–R7 workloads, R8 final notebook) |
 | `docs/DESIGN.md` | Scope decision (operator vs full workload), ceilings, metrics, measurement protocol, figures, CSV schema |
 | `docs/WORKLOADS.md` | Every workload pair: entry points in `../third_party/`, the non-DSMEM counterpart that exists, traps, priority |

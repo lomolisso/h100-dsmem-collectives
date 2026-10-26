@@ -17,7 +17,12 @@ results. They share only the environment (`docs/ENVIRONMENT.md`), the vendored m
 (`docs/REUSE.md`, `common/h100mb/`) and the GPU lock.
 
 ## Starting a new conversation
-One conversation = one roadmap task. A new conversation needs no further prompt:
+Conversation scope depends on the study:
+- `collectives/`: one conversation = one roadmap task, as described in this section and "Finishing a task".
+- `roofline/`: **one conversation for the whole roadmap (R0–R8)**. Steps 1 and 4 below apply; steps 2–3 and
+  "Finishing a task" step 3 are replaced by `roofline/CLAUDE.md` → "One conversation for the whole study".
+
+A new conversation needs no further prompt:
 1. Decide the study: the one the user names, else the directory the conversation started in, else ask.
 2. Open `<study>/ROADMAP.md` → **Task status**. Work on the first row that is not `done`:
    - `in review`: the previous task is committed but not approved. Ask the user for their review, apply

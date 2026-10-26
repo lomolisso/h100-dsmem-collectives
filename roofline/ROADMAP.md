@@ -1,14 +1,17 @@
 # ROADMAP — roofline study (tasks R0–R8)
 
-Imported by `roofline/CLAUDE.md`. One conversation = one task, run in order. How a conversation starts and
-ends, the commit rule and the subagent rule: `../CLAUDE.md`. Environment: `../docs/ENVIRONMENT.md`.
+Imported by `roofline/CLAUDE.md`. **All tasks run in order in one conversation** (`CLAUDE.md` → "One
+conversation for the whole study": single plan, when to stop for the user, resume, final review). Commit and
+subagent rules: `../CLAUDE.md`. Environment: `../docs/ENVIRONMENT.md`.
 Reusable code: `../docs/REUSE.md`. Design: `docs/DESIGN.md` (methodology, binding), `docs/WORKLOADS.md`
 (per-workload facts and traps), `docs/ADDING_A_WORKLOAD.md` (manifest reference and done-checklist).
 
 ## Task status
-Status values: `todo` · `in progress` (current conversation) · `in review` (committed locally, waiting for the
-user's review, not pushed) · `done` (approved and pushed). Update the row **before** the task's commit;
-"Key results" records what later tasks consume (numbers, file paths, decisions).
+Status values: `todo` · `in progress` (being worked on) · `in review` (committed locally, not pushed; the
+next task may start, the user reviews the whole study after R8) · `done` (approved and pushed, set for all rows
+at the end). Update the row **before** the task's commit; "Key results" records what later tasks consume
+(numbers, file paths, decisions) and is the record that survives summarisation of the conversation.
+A prerequisite "R<n> complete" holds when that row is `in review` or `done`.
 
 | ID | Task | Manifests | Status | Key results for later tasks |
 |---|---|---|---|---|
@@ -28,7 +31,7 @@ h100-microbench "GPU-3 bring-up" row (GPU lock value) ─┐  (needed for any GP
 R0 ─► R1 ─► R2 ─► R3 ─► R4 ─► R5 ─► R6 ─► R7 ─► R8
 ```
 R3–R7 depend only on R2 (the runner) and could run in any order; the order above is `docs/WORKLOADS.md` §0
-(value vs effort). R1 must be `done` before any figure is shown to the user. This roadmap does not depend on
+(value vs effort). R1 must be complete before any figure is shown to the user. This roadmap does not depend on
 `../collectives/` (the DSMEM ceiling is measured in R1).
 
 ## Shared facts for every task
@@ -77,7 +80,8 @@ safety, lock and clock handling as h100-microbench.
    `IMAGE=${H100MB_IMAGE:-$IMAGE_REPO:cuda12.9.1-$IMAGE_TAG}`, honoured by `tools/run` only — make sure
    `tools/env build` still builds the microbench image (unset `H100MB_IMAGE` there or keep a separate
    variable). Commit it in h100-microbench separately (`tools: H100MB_IMAGE override for derived images`)
-   after the user approves; do not push it without approval.
+   after the user approves (a stop point of the one-conversation protocol: ask, wait); do not push it
+   without approval.
 5. `roofline/tools/run`: `H100MB_IMAGE=<roofline tag> exec ~/work/fa2026/iacoma/h100-microbench/tools/run "$@"`,
    plus `PYTHONPATH`/cache variables pointing into `roofline/build/`. `tools/run` passes only `HOME`, `USER`
    and its own `H100MB_*` variables into the container (`h100-microbench/tools/run` l.54–79), so the wrapper
@@ -102,7 +106,7 @@ image build ≈ 30–60 min.
 ## R1 — Ceilings → `results/ceilings.csv`
 **Goal.** Measured ceilings of DESIGN §2.1 on GPU 3 at the locked clock, plus datasheet reference rows.
 
-**Prerequisites.** R0 `done`; GPU-3 bring-up `done`.
+**Prerequisites.** R0 complete; GPU-3 bring-up `done`.
 
 **Read first.** `docs/DESIGN.md` §2.1 and §5, `../docs/REUSE.md` (§2 table rows for `05`), the docstrings of
 `h100-microbench/experiments/05__memory_hierarchy_bandwidth/src/{bw_dram,bw_l2,bw_smem_l1}.cu`,
@@ -137,7 +141,7 @@ ceiling cell renders. GPU time ≈ 30 min.
 ## R2 — Manifest runner + the six CREDIT workloads
 **Goal.** One generic runner that takes a manifest from build to `points.csv`, proven on the simplest pairs.
 
-**Prerequisites.** R1 `done`.
+**Prerequisites.** R1 complete.
 
 **Read first.** `docs/DESIGN.md` §2.2–§3 and §5, `docs/ADDING_A_WORKLOAD.md`, `docs/WORKLOADS.md` §4 and §0,
 the six `workloads/credit_*.yaml`, `third_party/CREDIT` README and `src/workloads/*.cu` CLI.

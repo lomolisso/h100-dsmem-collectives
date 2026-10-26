@@ -21,9 +21,42 @@ Read, in this order: `docs/DESIGN.md` (scope decision, methodology, protocol, CS
 `docs/WORKLOADS.md` (every pair: entry points, baselines, traps), `docs/ADDING_A_WORKLOAD.md`
 (manifest reference), then the manifests. This study does not depend on `../collectives/`.
 
-## Starting a new conversation
-Follow `../CLAUDE.md` ("Starting a new conversation"): the task is the first row of the status table in
-`ROADMAP.md` that is not `done`; plan mode first; read the task card and the documents it lists.
+## One conversation for the whole study
+This study runs R0–R8 in **a single conversation**, task after task, without starting a new conversation
+per task. This section replaces steps 2–3 of `../CLAUDE.md` "Starting a new conversation" and step 3 of
+"Finishing a task"; everything else there (reading order, commit rules, subagent and GPU rules) applies.
+
+1. **Start.** Read the files of `../CLAUDE.md` step 4, all of `ROADMAP.md` (every card) and the documents of
+   the "Read first" lines of R0–R2. The starting task is the first row of the status table that is neither
+   `in review` nor `done` (normally R0; a later row when resuming, see 6).
+2. **One plan, in plan mode.** Present a plan for the whole remaining roadmap: detailed for the first two
+   tasks (code to write, runs, GPU time, result files with sizes, commits), one paragraph per later task
+   (what is built and run, GPU time, open risks), total GPU and image-build time, and the points where the
+   conversation will stop for the user (3). After approval, run all tasks in auto mode.
+3. **Stop and ask the user only** for: the h100-microbench `H100MB_IMAGE` commit (R0 step 4), a prerequisite
+   that does not hold, a material deviation from the approved plan (a new dependency outside the image plan,
+   a task needing more than 2× its GPU-time estimate, a manifest that cannot be measured beyond what its
+   card already allows, a change to `docs/DESIGN.md` methodology), and anything the binding rules forbid
+   doing alone. Otherwise continue to the next task without waiting.
+4. **Per task.** Before starting a task, re-read its card and the "Key results" of the earlier rows; set the
+   row to `in progress`. At its end, follow `../CLAUDE.md` "Finishing a task" steps 1–2: row `in review`,
+   "Key results" filled, one commit `roofline/R<n>: …`, **no push**; then go on with the next task. If the
+   user comments on a committed task mid-conversation, apply the change in a separate commit
+   (`roofline/R<n>: review fixes; …`) and continue.
+5. **Context.** The conversation will be summarised several times; durable state lives in files, not in the
+   conversation: `ROADMAP.md` "Key results", `docs/DESIGN.md` §6, the change log below and
+   `results/roofline__runs.csv`. Write them at the end of every task, before the commit. Keep long build
+   and profiler output in files under `results/` or `build/` and read only the parts needed; delegate
+   file-heavy reading and code writing to subagents (`../CLAUDE.md` "Subagents and tools") so that the main
+   conversation keeps conclusions, not file dumps. GPU runs stay strictly sequential.
+6. **Resume.** If the conversation ends before R8 (crash, user stop), a new conversation continues from the
+   first row that is neither `in review` nor `done`; a row left `in progress` is checked against the files
+   and `results/roofline__runs.csv` and either completed or restarted. It presents a plan for the remaining
+   tasks as in 2.
+7. **End.** After R8: summarise the whole study for the user (CLAUDE.md Workflow step 5, plus the list of
+   commits and what each task did not achieve) and ask for **one review of the whole study**. Apply the
+   requested changes, then, after explicit approval, set every row to `done`, commit
+   (`roofline: approved; R0–R8 done`) and push. Never force-push.
 
 ## H100 NVL server protocol (binding; details in `../docs/ENVIRONMENT.md`)
 
