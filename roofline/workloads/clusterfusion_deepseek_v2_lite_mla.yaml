@@ -1,39 +1,105 @@
 name: clusterfusion_deepseek_v2_lite_mla
 paper: ClusterFusion (NeurIPS 2025), Appendix B.1
-model: DeepSeek-V2-Lite single-token decode, fp16, fused MLA attention block (weight-absorbed)
+model: DeepSeek-V2-Lite single-token decode, fp16, fused MLA attention block (weight-absorbed, 16 heads)
 runnable: true
 precision: fp16_tensor
 scope_operator:
-  description: RMSNorm + Q/KV down-projections + RoPE + latent RMSNorm + W_UK absorb + MQA flash-decoding over the latent cache + W_UV + O-proj, 16 heads
+  description: RMSNorm + q / kv_a projections (q_nope|q_pe, c_kv|k_pe) + NEOX RoPE on q_pe, k_pe + latent RMSNorm + W_UK absorption + MQA flash-decoding over the latent cache (K = V = c_kv, 512 dims, S-1 cached tokens + the new one; no q_pe.k_pe term, as the fused kernel) + W_UV + O-proj summed over 16 heads
   shapes:
     s4k: {hidden: 2048, heads: 16, nope: 128, rope: 64, lora: 512, seq_len: 4096}
-  flops: "2*hidden*(heads*nope + heads*rope + lora + rope) + 2*heads*nope*lora + 4*seq_len*heads*(lora + rope) + 2*heads*lora*nope + 2*heads*nope*hidden"
-  min_hbm_bytes: "2*(hidden*(heads*nope + heads*rope + lora + rope) + heads*nope*lora + heads*lora*nope + heads*nope*hidden) + 2*seq_len*(lora + rope)"
-  validate: {reference: "torch fp32 reference to be written by the agent (no test exists in the repo)", tolerance: "max abs 5e-2 fp16"}
+  # algorithmic count, each quantity once (kernel.cuh, wrapper docstring): q GEMV 2*h*heads*(nope+rope); kv_a GEMV
+  # 2*h*(lora+rope); W_UK + W_UV 2*2*heads*nope*lora; attention QK + PV over seq_len tokens (latent only)
+  # 4*seq_len*heads*lora; O-proj 2*heads*nope*h; softmax scale/exp-sub/sum 3*seq_len*heads; two RMSNorms
+  # (x^2 FFMA + 2 FMUL) 4*(h+lora); RoPE (2 mul + add) 3*(heads+1)*rope. s4k: 161.95 MFLOP. The fused kernel
+  # executes more: every head cluster recomputes c_kv|k_pe and the latent RMSNorm (+35.4 MFLOP, x1.22), per-thread
+  # duplicate softmax arithmetic and shuffle-reduction FADDs (see notes)
+  flops: "2*hidden*heads*(nope+rope) + 2*hidden*(lora+rope) + 4*heads*nope*lora + 4*seq_len*heads*lora + 2*heads*nope*hidden + 3*seq_len*heads + 4*(hidden+lora) + 3*(heads+1)*rope"
+  # fp16 weights once: Wq_nope|Wq_pe, Wkv|Wkpe, W_UK, W_UV, Wo; latent part of the cache 2*seq_len*lora (the fused
+  # kernel TMA-loads columns 0..511 of all seq_len rows, the baseline reads seq_len rows of its [S, 512] cache);
+  # x, w_in, o (2*3*h), w_ckv 2*lora, cos/sin fp32 2*4*rope. s4k: 31.73 MB. Not included: the baseline's KV append
+  # (1152 B written; the fused kernel does not append) and the k_pe cache (read by neither)
+  min_hbm_bytes: "2*(hidden*heads*(nope+rope) + hidden*(lora+rope) + 2*heads*nope*lora + heads*nope*hidden) + 2*seq_len*lora + 2*(3*hidden + lora) + 8*rope"
+  validate:
+    reference: "unfused sequence of the wrapper (flashinfer + torch, written in R7: no upstream test exists) on identical inputs, for fused_c1 and fused_c4 (20 launches each, inputs checked unchanged); the unfused variant against an fp32 torch implementation of the same maths (o, and the appended cache rows c_kv_new and k_pe after RoPE)"
+    tolerance: "o (the only output of the fused kernel): rel. L2 <= 1e-2 and max abs <= 2e-2 * max|ref|, finite, every launch (criteria of clusterfusion_llama2_7b_decoder; a CPU emulation of the fused kernel's fp16 P.V accumulation predicts a_lat rel. L2 2.2e-3 for cluster 4 and 4.8e-3 for cluster 1); same criteria for the unfused appended rows vs fp32; plus the kernel audit (every kernel of one step matches `kernels` or is a declared exclusion)"
   variants:
     - id: unfused
       role: non_dsmem
-      description: unfused torch/flashinfer sequence (to be written; MQA decode via flashinfer with head_dim 576)
-      build: {cwd: third_party/ClusterFusion, cmd: "pip install -e ."}
-      run:   {cwd: third_party/ClusterFusion, cmd: "agent script"}
-      kernels: [".*"]
+      description: flashinfer rmsnorm -> cuBLAS q GEMV (N 3072) and kv_a GEMV (N 576) -> flashinfer rmsnorm(c_kv) into the cache row -> flashinfer RoPE (q_pe in place, k_pe into the cache row) -> cuBLAS bmm W_UK -> flashinfer.single_decode_with_kv_cache (head_dim 512, group 16, K = V = latent cache) -> cuBLAS bmm W_UV -> cuBLAS O-proj GEMV
+      # no ClusterFusion code is used; the command pre-compiles the flashinfer JIT modules of the wrapper (no GPU)
+      build: {cwd: third_party/ClusterFusion, cmd: "python3 {harness}/workloads/clusterfusion_deepseek_v2_lite_mla.py --warm-jit"}
+      run:
+        cmd: "python3 {harness}/workloads/clusterfusion_deepseek_v2_lite_mla.py --variant unfused --hidden {hidden} --heads {heads} --nope {nope} --rope {rope} --lora {lora} --seq_len {seq_len} --warmup {warmup} --iters {iters}"
+      validate:
+        cmd: "python3 {harness}/workloads/clusterfusion_deepseek_v2_lite_mla.py --variant unfused --hidden {hidden} --heads {heads} --nope {nope} --rope {rope} --lora {lora} --seq_len {seq_len} --validate"
+        expect: ["^CHECK variant=unfused .*failed=0 ", "^VALIDATION PASS$"]
+      # flashinfer CUDA norm kernel (x2); cuBLAS GEMV / batched GEMM names (gemv2T/gemvx, nvjet_*, sm90_xmma_*,
+      # cutlass, split-K reduce); flashinfer RoPE kernel; flashinfer decode kernel + MergeStates of its partition-kv
+      # path (S > 256)
+      kernels: ["RMSNormKernel", "gemv|gemm|nvjet|splitKreduce|cutlass|xmma|cublas", "BatchQKApplyRotaryPosIdsCosSinCache", "SingleDecodeWithKVCacheKernel|MergeStates|AttentionSumKernel"]
       cluster_size: null
     - id: fused_c1
       role: control
-      description: fused kernel rebuilt with CLUSTER_SIZE 1 in include/H100/deepseek/config.h
-      build: {cwd: third_party/ClusterFusion, cmd: "git apply ../../roofline/patches/clusterfusion__deepseek_cluster_size_1.patch && pip install -e .", patch: patches/clusterfusion__deepseek_cluster_size_1.patch}
-      run:   {cwd: third_party/ClusterFusion, cmd: "python -c 'import clusterfusion; clusterfusion.deepseek_decoder_layer(...)' # agent script"}
+      description: same fused kernel rebuilt with CLUSTER_SIZE 1 + three cluster-1 correctness fixes (RMSNorm prologue, all 512 W_UK outputs, all 512 W_UV rows); one CTA per head, 16 CTAs, no DSMEM
+      build: {cwd: third_party/ClusterFusion, patch: patches/clusterfusion__deepseek_cluster_size_1.patch, cmd: "python3 {harness}/workloads/build_clusterfusion.py", env: {MAX_JOBS: "16"}}
+      run:
+        cmd: "python3 {harness}/workloads/clusterfusion_deepseek_v2_lite_mla.py --variant fused_c1 --hidden {hidden} --heads {heads} --nope {nope} --rope {rope} --lora {lora} --seq_len {seq_len} --warmup {warmup} --iters {iters}"
+        pythonpath: ["{worktree}"]
+      validate:
+        cmd: "python3 {harness}/workloads/clusterfusion_deepseek_v2_lite_mla.py --variant fused_c1 --hidden {hidden} --heads {heads} --nope {nope} --rope {rope} --lora {lora} --seq_len {seq_len} --validate"
+        expect: ["^setup: clusterfusion from .*/ClusterFusion__clusterfusion__deepseek_cluster_size_1/clusterfusion$", "^CHECK variant=fused_c1 .*failed=0 ", "^VALIDATION PASS$"]
       kernels: ["DeepSeekDecoderLayerKernel"]
       cluster_size: 1
     - id: fused_c4
       role: dsmem
-      description: shipped fused MLA kernel, cluster 4 per head, DSMEM AllReduce + AllGather
-      build: {cwd: third_party/ClusterFusion, cmd: "pip install -e ."}
-      run:   {cwd: third_party/ClusterFusion, cmd: "python -c 'import clusterfusion; clusterfusion.deepseek_decoder_layer(...)' # agent script"}
+      description: shipped fused MLA kernel + TMA-buffer and local_qkv WAR fixes + dsm.cuh cluster_reduce hardening (patches/clusterfusion__residual_out_c4_fix.patch, shared with the Llama fused_c4; none of the races was observed here, the unpatched pin passed 20/20 and ran 223.5 us, R7), 16 head clusters x 4 CTAs (64 CTAs); DSMEM scalar AllReduces (remote atomics/stores), projection AllReduce and attention AllReduces (bulk push), q_lat AllGather
+      build: {cwd: third_party/ClusterFusion, patch: patches/clusterfusion__residual_out_c4_fix.patch, cmd: "python3 {harness}/workloads/build_clusterfusion.py", env: {MAX_JOBS: "16"}}
+      run:
+        cmd: "python3 {harness}/workloads/clusterfusion_deepseek_v2_lite_mla.py --variant fused_c4 --hidden {hidden} --heads {heads} --nope {nope} --rope {rope} --lora {lora} --seq_len {seq_len} --warmup {warmup} --iters {iters}"
+        pythonpath: ["{worktree}"]
+      validate:
+        cmd: "python3 {harness}/workloads/clusterfusion_deepseek_v2_lite_mla.py --variant fused_c4 --hidden {hidden} --heads {heads} --nope {nope} --rope {rope} --lora {lora} --seq_len {seq_len} --validate"
+        expect: ["^setup: clusterfusion from .*/ClusterFusion__clusterfusion__residual_out_c4_fix/clusterfusion$", "^CHECK variant=fused_c4 .*failed=0 ", "^VALIDATION PASS$"]
       kernels: ["DeepSeekDecoderLayerKernel"]
       cluster_size: 4
 scope_layer: null
 measure: {reps: 100, warmup: 20, flush_l2: true}
 notes: >
-  SEQ_LEN is compile-time (4096). No Python test or reference exists; lowest ClusterFusion priority.
-  The fused kernel ends with global atomicAdd across heads for the O-projection in both variants.
+  Wrapper roofline/harness/workloads/clusterfusion_deepseek_v2_lite_mla.py (docstring: what the kernel computes with
+  kernel.cuh line numbers, baseline design). Semantics of the fused kernel (read from the code, no upstream test):
+  absorbed MLA decode without the rope score term - q_pe and k_pe are projected and rotated but never read by the
+  attention (cache TMA boxes cover only the 512 latent columns, the score uses q_lat only) - and without a KV append
+  (the new latent replaces cache row S-1 in registers; the cache is never written). The baseline computes exactly
+  this (flashinfer single decode at head_dim 512, K = V = latent cache) and also the discarded q_pe / k_pe work; it
+  appends the new c_kv / k_pe at row S-1 of its own caches, so both attend over S-1 cached tokens + the new one.
+  flashinfer's MLA wrapper is not used (it always adds q_pe . k_pe). SEQ_LEN = 4096 is a compile-time constant
+  (config.h, dispatcher TMA maps): one shape; other lengths need a rebuild per length (SEQ_LEN / CLUSTER_SIZE / 16
+  must be even for the double-buffer tail), not done.
+  Build: build_clusterfusion.py (R4) in the worktrees ClusterFusion__clusterfusion__residual_out_c4_fix (fused_c4; the
+  same worktree and stamp as the Llama fused_c4) and ClusterFusion__clusterfusion__deepseek_cluster_size_1 (fused_c1);
+  the unfused variant builds in ClusterFusion__pin; the unfused build command
+  only pre-compiles the flashinfer JIT modules (CUDA norm, RoPE, single decode fp16 head_dim 512) into
+  roofline/build/cache/flashinfer, needed by every variant's validation (the unfused sequence is the reference).
+  fused_c1: upstream's CLUSTER_SIZE 1 build is wrong in three places (RMSNorm prologue registers - the Llama kernel's
+  bug pattern; q_nope @ W_UK computes only 128 of the 512 latent outputs; a_lat @ W_UV contracts only 128 of 512
+  rows), fixed in the patch (header). Only cluster sizes 1 (patched) and 4 are correct: the scalar and vector reduces
+  run N-2 shift rounds (0 for N = 2, double counting for N >= 8). The Llama residual race does not exist here (no
+  residual; the kernel only reads its inputs, checked bit-exactly after 20 launches); the O-projection sums the 16
+  heads with fp16 atomicAdd, so o is not bit-deterministic (spread reported). Shared-memory races of the shipped
+  kernel (code reading; none observed here, the pin passed 20/20) fixed in both fused builds: the TMA double buffers
+  are refilled before every warp has read the previous tile (the race that broke the Llama cluster-4 build; one
+  block.sync at the top of the W_q, W_q_pe, W_kv, W_k_pe, flash-decoding and W_UV loops), and in CTA 0 of every
+  cluster the q_lat (pin l.386) and W_UV partial (pin l.635) writes into local_qkv[0..128) can overtake other warps'
+  reads of the same range (block.sync before each write; the cluster-1 patch already kept q_lat in registers).
+  fused_c4 also gets the dsm.cuh cluster_reduce hardening (spec-required, not observed). Running max initialised to 0, not -inf (exact unless all
+  scores << 0).
+  Numerics of the fused kernel: fp16 products (HMUL) accumulated in fp32 in every GEMV, fp16 partials and fp16
+  cluster sums, P.V accumulated in fp16 registers (dominant error, see tolerance); flashinfer/cuBLAS accumulate in fp32.
+  FLOPs: `flops` counts the work once; ncu counters on the fused kernels will exceed it (redundant c_kv|k_pe per
+  head cluster x1.22, duplicated softmax arithmetic in the 64 threads of a tile row, warp-shuffle FADDs; HMUL +
+  FADD instead of FFMA) - to be explained in the notebook, not adjusted. Kernels: the unfused regexes are broad on
+  purpose (cuBLAS picks its GEMV kernel at run time); the validation's kernel audit fails on any unmatched kernel of
+  one step and prints KERNELS_PER_ITER (expected ~10 for unfused: 2 norms, 4-6 cuBLAS, 1 RoPE, decode + merge).
+  The fused dispatcher's torch::full zero-fill of o (FillFunctor, 4 KB) is excluded; it re-encodes 9 TMA maps and
+  calls cudaDeviceSynchronize 3 times per call (host only; kernel durations are measured). Precision: the fused
+  kernel runs on CUDA cores; the field keeps fp16_tensor (the point is far below both ceilings), as R4.

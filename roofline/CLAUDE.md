@@ -145,3 +145,11 @@ per task. This section replaces steps 2–3 of `../CLAUDE.md` "Starting a new co
   CLUSTER_SIZE 1 + RMSNorm prologue fix (only the last of the 4 chunks stayed in registers at cluster 1) + (1) + (2).
   Wrapper bug found and fixed in our harness: the fused variants had been validated against a second fused launch
   instead of the unfused sequence (determinism only); all fused validations were re-run against the unfused reference.
+- 2026-10-26 (R7) ClusterFusion DeepSeek-V2-Lite `DeepSeekDecoderLayerKernel`: the cluster-1 control
+  (`patches/clusterfusion__deepseek_cluster_size_1.patch`) needed three fixes — RMSNorm prologue (as Llama), the q_nope·W_UK
+  loop computed 128 of 512 latent outputs, the a_lat·W_UV loop contracted 128 of 512 rows (bounds hard-coded for
+  cluster 4) — plus the TMA-buffer `block.sync()`s. The DSMEM build (`clusterfusion__residual_out_c4_fix.patch`, shared
+  with Llama) adds the TMA-buffer barriers (W_q, W_q_pe, W_kv, W_k_pe, decode, W_uv loops) and a `block.sync()` before
+  CTA 0's in-place q_lat / W_UV-partial writes into `local_qkv` (read by other warps); none was observed failing
+  (the pin validated 20/20 and ran 223.5 µs; fixed 226.6 µs). Not fixed (documented in WORKLOADS §2): as shipped the
+  kernel omits the RoPE score term and the KV append; the baseline computes the same function.

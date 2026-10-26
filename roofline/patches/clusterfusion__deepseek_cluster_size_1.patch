@@ -1,3 +1,32 @@
+roofline control variant `fused_c1` of workloads/clusterfusion_deepseek_v2_lite_mla.yaml (applied by the runner in the
+worktree roofline/build/src/ClusterFusion__clusterfusion__deepseek_cluster_size_1/, never in third_party/).
+Upstream's CLUSTER_SIZE 1 build of the DeepSeek MLA kernel is wrong, not only untested (found in R7 by reading
+include/H100/deepseek/kernel.cuh; three stages hard-code the cluster-4 work split):
+0. config.h: CLUSTER_SIZE 4 -> 1 (one CTA per head, 16 CTAs; the cluster reduce / gather loops run zero rounds, which
+   is correct for N = 1: dsm.cuh runs N-2 shift rounds for the reduces and N-1 for the QUK all-gather).
+1. RMSNorm prologue (kernel.cuh l.119-125): the normalisation loop reuses x from the registers of the last iteration
+   of the sum loop; correct only for DIM_PER_BLOCK = HIDDEN_DIM / CLUSTER_SIZE = BLOCK_SIZE * 4 = 512 (cluster 4).
+   With 2048 (cluster 1) every chunk would be normalised from chunk 3. Fix: reload the chunk from `input` (read-only).
+   Same bug pattern as the Llama kernel (patches/clusterfusion__cluster_size_1.patch).
+2. q_nope @ W_uk (l.352-388): CTA b computes the 128 latent outputs [b*128, b*128+128) of the 512 and the QUK
+   all-gather collects the four slices. With one CTA only q_lat[0..128) was computed; q_lat[128..512) kept the
+   uninitialised bytes of local_qkv. Fix: loop over KV_LORA_RANK / 128 / CLUSTER_SIZE slices of 128 (TMA column
+   offset + s * 128), results kept in registers and written after the last slice (the first slice's output overwrites
+   q_nope = local_qkv[0..128), which every slice reads), block.sync at the end of each slice before the next TMA reuses
+   weight[].
+3. a_lat @ W_uv (l.601-637): CTA b contracts rows [b*128, b*128+128) of W_uv (loop bound `128 / TMA_LOAD_ONCE`, tail
+   offset `NOPE_HEAD_DIM - TMA_LOAD_ONCE` = 64 = 128 - 64). With one CTA only a_lat[0..128) entered the head output.
+   Fix: bounds KV_LORA_RANK / CLUSTER_SIZE (= 128 for cluster 4, numerically unchanged there).
+4. TMA-buffer WAR (same pattern as the Llama kernel, where it was the cause of the cluster-4 failures, see
+   patches/clusterfusion__residual_out_c4_fix.patch fix 2): the W_q, W_q_pe, W_kv (+ its per-slice restart), W_k_pe,
+   flash-decoding and W_uv loops refill TMA buffer id % 2 while warps 1-3 may still read the previous tile from it;
+   block.sync() at the top of each. Not observed in the DeepSeek kernel (fused_c1 passed 20/20 before); added so that
+   both fused builds run the same code (the cluster-4 patch carries the same lines). Same for the block.sync() before
+   the W_UV partial is written into local_qkv[0..128) (with one CTA that range holds a_lat rows the other warps read;
+   at most one tile of lag makes it unreachable here, it is a real race in CTA 0 of the cluster-4 build).
+For CLUSTER_SIZE 4 fixes 1 and 3 are numerically no-ops and fix 2 differs only by one extra block.sync; fused_c4 is
+built with patches/clusterfusion__residual_out_c4_fix.patch (fix 4 and the dsm.cuh hardening, no fixes 1-3). Not changed (unobservable in the output, identical in both fused builds): the k_pe RoPE
+partner index (l.305 misses `+ KV_LORA_RANK`) and the q_pe / k_pe values, which the attention never reads.
 diff --git a/include/H100/deepseek/config.h b/include/H100/deepseek/config.h
 index a1a1d15..8008855 100644
 --- a/include/H100/deepseek/config.h
@@ -11,3 +40,139 @@ index a1a1d15..8008855 100644
  #define NUM_PER_THREAD 8
  #define NUM_ROW_PER_WARP (NOPE_HEAD_DIM / NUM_WARPS) 
  #define NUM_THREAD_PER_ROW (WARP_SIZE / NUM_ROW_PER_WARP) 
+diff --git a/include/H100/deepseek/kernel.cuh b/include/H100/deepseek/kernel.cuh
+index 93e1ce7..567d32e 100644
+--- a/include/H100/deepseek/kernel.cuh
++++ b/include/H100/deepseek/kernel.cuh
+@@ -118,6 +118,9 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) DeepSeekDecoderLayerKernel(
+     rms_rcp = __frsqrt_rn(cluster_local_sum / HIDDEN_DIM + eps);
+     for (int d = tid * 4; d < DIM_PER_BLOCK; d+=BLOCK_SIZE * 4) { 
+         *(uint64_t*)(&reg_weight[0]) = *(uint64_t*)(&w_rms_input[cluster_block_st_idx + d]);
++        // roofline control patch (fix 1): reload this chunk of x; upstream normalises the registers of the last
++        // iteration of the sum loop, correct only when DIM_PER_BLOCK = BLOCK_SIZE * 4 (CLUSTER_SIZE 4)
++        *(uint64_t*)(&reg_input[0]) = *(uint64_t*)(&input[cluster_block_st_idx + d]);
+         for (int i = 0; i < 4; i++) {
+             reg_input[i] = __float2half(__half2float(reg_input[i]) * rms_rcp * __half2float(reg_weight[i]));
+         }
+@@ -135,6 +138,8 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) DeepSeekDecoderLayerKernel(
+     }
+ 
+     for (int id = 1; id < DIM_PER_BLOCK / TMA_LOAD_ONCE; id++) {
++        // roofline TMA-buffer WAR fix: tid 0 refills a TMA buffer below; every warp must be done reading its previous tile
++        block.sync();
+         if (tid == 0) {
+             cde::cp_async_bulk_tensor_2d_global_to_shared(&weight[(id % 2) * TMA_LOAD_ONCE_NUM], &tensor_map_weight_q, cluster_head_idx, cluster_block_st_idx + id * TMA_LOAD_ONCE, bar[id % 2]);
+             token[id % 2] = cuda::device::barrier_arrive_tx(bar[id % 2], 1, TMA_LOAD_ONCE_SIZE);
+@@ -173,6 +178,8 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) DeepSeekDecoderLayerKernel(
+ 
+     tmp = 0.0;
+     for (int id = 1; id < DIM_PER_BLOCK / 128; id++) {
++        // roofline TMA-buffer WAR fix: tid 0 refills a TMA buffer below; every warp must be done reading its previous tile
++        block.sync();
+         if (tid == 0) {
+             cde::cp_async_bulk_tensor_2d_global_to_shared(&weight[(id % 2) * TMA_LOAD_ONCE_NUM], &tensor_map_weight_q_pe, cluster_head_pe_idx, cluster_block_st_idx + id * 128, bar[id % 2]);
+             token[id % 2] = cuda::device::barrier_arrive_tx(bar[id % 2], 1, TMA_LOAD_ONCE_SIZE);
+@@ -207,6 +214,8 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) DeepSeekDecoderLayerKernel(
+ 
+     // Compute input @ w_kv
+     for (int s = 0; s < KV_LORA_RANK / 128; s++) {
++        // roofline TMA-buffer WAR fix: tid 0 refills a TMA buffer below; every warp must be done reading its previous tile
++        block.sync();
+         tmp = 0.0;
+         if (tid == 0) {
+             cde::cp_async_bulk_tensor_2d_global_to_shared(&weight[0], &tensor_map_weight_kv, s * 128, cluster_block_st_idx, bar[0]);
+@@ -216,6 +225,8 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) DeepSeekDecoderLayerKernel(
+         }
+ 
+         for (int id = 1; id < DIM_PER_BLOCK / TMA_LOAD_ONCE; id++) {
++            // roofline TMA-buffer WAR fix: tid 0 refills a TMA buffer below; every warp must be done reading its previous tile
++            block.sync();
+             if (tid == 0) {
+                 cde::cp_async_bulk_tensor_2d_global_to_shared(&weight[(id % 2) * TMA_LOAD_ONCE_NUM], &tensor_map_weight_kv, s * 128, cluster_block_st_idx + id * TMA_LOAD_ONCE, bar[id % 2]);
+                 token[id % 2] = cuda::device::barrier_arrive_tx(bar[id % 2], 1, TMA_LOAD_ONCE_SIZE);
+@@ -255,6 +266,8 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) DeepSeekDecoderLayerKernel(
+ 
+     tmp = 0.0;
+     for (int id = 1; id < DIM_PER_BLOCK / 128; id++) {
++        // roofline TMA-buffer WAR fix: tid 0 refills a TMA buffer below; every warp must be done reading its previous tile
++        block.sync();
+         if (tid == 0) {
+             cde::cp_async_bulk_tensor_2d_global_to_shared(&weight[(id % 2) * TMA_LOAD_ONCE_NUM], &tensor_map_weight_k_pe, 0, cluster_block_st_idx + id * 128, bar[id % 2]);
+             token[id % 2] = cuda::device::barrier_arrive_tx(bar[id % 2], 1, TMA_LOAD_ONCE_SIZE);
+@@ -350,8 +363,14 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) DeepSeekDecoderLayerKernel(
+     block.sync();
+     
+     // Compute q @ w_uk
++    // roofline control patch (fix 2): a CTA computes KV_LORA_RANK / CLUSTER_SIZE latent outputs in slices of 128
++    // (upstream: one slice, i.e. only q_lat[0..128) for CLUSTER_SIZE 1). Results stay in registers until every
++    // slice has read q_nope = local_qkv[0..128), which the first slice's output overwrites; a block.sync per slice
++    // protects weight[] from the next slice's TMA.
++    float q_uk[KV_LORA_RANK / 128 / CLUSTER_SIZE];
++    for (int s = 0; s < KV_LORA_RANK / 128 / CLUSTER_SIZE; s++) {
+     if (tid == 0) {
+-        cde::cp_async_bulk_tensor_2d_global_to_shared(&weight[0], &tensor_map_weight_uk, cluster_head_uk_idx, 0, bar[0]);
++        cde::cp_async_bulk_tensor_2d_global_to_shared(&weight[0], &tensor_map_weight_uk, cluster_head_uk_idx + s * 128, 0, bar[0]);
+         token[0] = cuda::device::barrier_arrive_tx(bar[0], 1, TMA_LOAD_ONCE_SIZE);
+     } else {
+         token[0] = bar[0].arrive();
+@@ -360,7 +379,7 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) DeepSeekDecoderLayerKernel(
+     tmp = 0.0;
+     for (int id = 1; id < NOPE_HEAD_DIM / TMA_LOAD_ONCE; id++) {
+         if (tid == 0) {
+-            cde::cp_async_bulk_tensor_2d_global_to_shared(&weight[(id % 2) * TMA_LOAD_ONCE_NUM], &tensor_map_weight_uk, cluster_head_uk_idx, id * TMA_LOAD_ONCE, bar[id % 2]);
++            cde::cp_async_bulk_tensor_2d_global_to_shared(&weight[(id % 2) * TMA_LOAD_ONCE_NUM], &tensor_map_weight_uk, cluster_head_uk_idx + s * 128, id * TMA_LOAD_ONCE, bar[id % 2]);
+             token[id % 2] = cuda::device::barrier_arrive_tx(bar[id % 2], 1, TMA_LOAD_ONCE_SIZE);
+         } else {
+             token[id % 2] = bar[id % 2].arrive();
+@@ -382,8 +401,12 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) DeepSeekDecoderLayerKernel(
+             tmp += __half2float(__hmul(reg_input[d], weight[TMA_LOAD_ONCE_NUM + (input_idx + i + d) * 128 + weight_idx]));
+         }
+     }
++    q_uk[s] = tmp;
++    block.sync();
++    }
+     if (lane_id % NUM_THREAD_PER_ROW == 0) {
+-        local_qkv[cluster_block_id * 128 + warp_id * NUM_ROW_PER_WARP + lane_id / NUM_THREAD_PER_ROW] = __float2half(tmp);
++        for (int s = 0; s < KV_LORA_RANK / 128 / CLUSTER_SIZE; s++)
++            local_qkv[cluster_block_id * (KV_LORA_RANK / CLUSTER_SIZE) + s * 128 + warp_id * NUM_ROW_PER_WARP + lane_id / NUM_THREAD_PER_ROW] = __float2half(q_uk[s]);
+     }
+     block.sync();
+ 
+@@ -413,6 +436,8 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) DeepSeekDecoderLayerKernel(
+     }
+ 
+     for (int id = 1; id < KV_DIM_PER_BLOCK / TMA_LOAD_ONCE_ATTN; id++) {
++        // roofline TMA-buffer WAR fix: tid 0 refills a TMA buffer below; every warp must be done reading its previous tile
++        block.sync();
+         if (tid == 0) {
+             cde::cp_async_bulk_tensor_2d_global_to_shared(&weight[(id % 2) * TMA_LOAD_ONCE_NUM_ATTN], &tensor_map_kv_cache, 0, cluster_block_id * KV_DIM_PER_BLOCK + id * TMA_LOAD_ONCE_ATTN, bar[id % 2]);
+             cde::cp_async_bulk_tensor_2d_global_to_shared(&weight[(id % 2) * TMA_LOAD_ONCE_NUM_ATTN + TMA_LOAD_ONCE_NUM_ATTN / 2], &tensor_map_kv_cache_, KV_LORA_RANK / 2, cluster_block_id * KV_DIM_PER_BLOCK + id * TMA_LOAD_ONCE_ATTN, bar[id % 2]);
+@@ -607,7 +632,11 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) DeepSeekDecoderLayerKernel(
+     }
+ 
+     tmp = 0.0;
+-    for (int id = 1; id < 128 / TMA_LOAD_ONCE; id++) {
++    // roofline control patch (fix 3): contract the CTA's KV_LORA_RANK / CLUSTER_SIZE rows of w_uv (upstream: 128,
++    // i.e. a_lat[0..128) only for CLUSTER_SIZE 1)
++    for (int id = 1; id < (KV_LORA_RANK / CLUSTER_SIZE) / TMA_LOAD_ONCE; id++) {
++        // roofline TMA-buffer WAR fix: tid 0 refills a TMA buffer below; every warp must be done reading its previous tile
++        block.sync();
+         if (tid == 0) {
+             cde::cp_async_bulk_tensor_2d_global_to_shared(&weight[(id % 2) * TMA_LOAD_ONCE_NUM], &tensor_map_weight_uv, cluster_head_idx, cluster_block_st_uv_idx + id * TMA_LOAD_ONCE, bar[id % 2]);
+             token[id % 2] = cuda::device::barrier_arrive_tx(bar[id % 2], 1, TMA_LOAD_ONCE_SIZE);
+@@ -625,12 +654,14 @@ __global__ void __cluster_dims__(CLUSTER_SIZE, 1, 1) DeepSeekDecoderLayerKernel(
+     }
+     bar[1].wait(std::move(token[1]));
+     for (int i = 0; i < TMA_LOAD_ONCE; i+=NUM_PER_ROW) { 
+-        *(uint4*)(&reg_input[0]) = *(uint4*)(&local_qkv[cluster_block_st_uv_idx + input_idx + (NOPE_HEAD_DIM - TMA_LOAD_ONCE) + i]);
++        *(uint4*)(&reg_input[0]) = *(uint4*)(&local_qkv[cluster_block_st_uv_idx + input_idx + (KV_LORA_RANK / CLUSTER_SIZE - TMA_LOAD_ONCE) + i]);  // roofline fix 3
+         #pragma unroll
+         for (int d = 0; d < NUM_PER_THREAD; d++) {
+             tmp += __half2float(__hmul(reg_input[d], weight[TMA_LOAD_ONCE_NUM + (input_idx + i + d) * 128 + weight_idx]));
+         }
+     }
++    // roofline local_qkv WAR fix: this write hits local_qkv[0..128), which in CTA 0 other warps may still be reading (q_nope / a_lat slice 0)
++    block.sync();
+     if (lane_id % NUM_THREAD_PER_ROW == 0) {
+         local_qkv[warp_id * NUM_ROW_PER_WARP + lane_id / NUM_THREAD_PER_ROW] = __float2half(tmp);
+     }
