@@ -1,42 +1,87 @@
 name: dak_gemm_multicast
 paper: DAK (arXiv 2604.26074)
-model: OPT / Llama linear layer, fp16, C[tokens, M] = X[tokens, K] . W[K, M]
+model: OPT / Llama linear layer, fp16, C[tokens, m] = X[tokens, k] . W[k, m]  (W stored k x m, DAK's layout)
 runnable: true
 precision: fp16_tensor
 scope_operator:
-  description: tiled fp16 GEMM (WGMMA 64x256x16), weight tiles delivered by TMA multicast to a 2-CTA cluster
-  shapes:
-    t512:  {tokens: 512,  m: 4096, k: 4096}
-    t1024: {tokens: 1024, m: 4096, k: 4096}
-    t512_opt30b: {tokens: 512, m: 7168, k: 7168}
+  description: tiled fp16 GEMM (WGMMA SM90_64x256x16_F16F16F16, fp16 accumulator), per CTA two 64(m) x 256(tokens) output tiles; weight tiles by TMA (multicast to a 2-CTA cluster in the DSMEM variant)
+  shapes:   # kernel constraints: tokens % 512 == 0 (multicast pairing), m % 128 == 0, k % 64 == 0; tokens/256 divides 132 (no duplicated tiles)
+    llama_qo_t512:   {tokens: 512,  m: 4096,  k: 4096}    # Llama-2-7B q/k/v/o projection
+    llama_qo_t1024:  {tokens: 1024, m: 4096,  k: 4096}
+    llama_up_t1024:  {tokens: 1024, m: 11008, k: 4096}    # Llama-2-7B gate/up projection
+    llama_down_t1024: {tokens: 1024, m: 4096, k: 11008}   # Llama-2-7B down projection
+    opt30b_qo_t512:  {tokens: 512,  m: 7168,  k: 7168}    # OPT-30B attention projection
+    opt30b_fc1_t512: {tokens: 512,  m: 28672, k: 7168}    # OPT-30B fc1 (DAK's GH200 configuration)
   flops: "2*tokens*m*k"
-  min_hbm_bytes: "2*(m*k + tokens*k + tokens*m)"
-  validate: {reference: "torch nn.Linear (MAPE printed by benchmark_linear.py)", tolerance: "MAPE < 1e-2"}
+  min_hbm_bytes: "2*(m*k + tokens*k + tokens*m)"   # fp16 W + X read once, C written once
+  validate:
+    reference: "torch.matmul in fp32 of the same fp16 X, W (wrapper check(); 5 repetitions on an output pre-filled with NaN, plus one call through the upstream LinearMulticast.forward for the DAK variants)"
+    tolerance: "all outputs finite and, per 256(tokens) x 64(m) output tile, ||C - ref||_F / ||ref||_F <= 4 * sqrt(k/16) * 2^-11 (fp16 accumulator rounded once per k16 WGMMA step; 0.031 at k = 4096, 0.051 at k = 11008); the same bound for cuBLAS (fp32 accumulate, its error is far below it)"
   variants:
     - id: multicast_prefill
       role: non_dsmem
-      description: gemv_multicast_prefill - identical tiles/smem/warp roles/MMA atom, plain per-CTA TMA loads (what benchmark_linear.py --type multicast runs by default, prefill=True)
-      build: {cwd: third_party/DirectAccessKernel, cmd: "bash setup.sh && make pyext arch=90a"}
-      run:   {cwd: third_party/DirectAccessKernel, cmd: "python benchmark/benchmark_linear.py --type multicast --offload 0 --m {m} --k {k} --n {tokens} --graph"}
+      description: gemv_multicast_prefill - same tiles, smem layout, warp roles and MMA atom as gemv_multicast, no cluster, every CTA loads its own weight tiles by plain TMA (LinearMulticast.prefill = True, the upstream default; 128 working CTAs of the 132 launched)
+      build:
+        cwd: third_party/DirectAccessKernel
+        cmd: "export NVCC_APPEND_FLAGS=\"-I$CUTLASS_INCLUDE\" && make runtime.o .build_tile_n arch=90a TILE_N=8 && DAK_ARCH=90a DAK_TILE_N=8 MAX_JOBS=8 python3 setup.py build_ext --inplace && python3 -c 'import glob, sys; sys.exit(0 if glob.glob(\"python/offload/runtime*.so\") else 1)'"
+      run:
+        cmd: "python3 {harness}/workloads/dak_gemm_multicast.py --variant multicast_prefill --warmup {warmup} --iters {iters} --tokens {tokens} --m {m} --k {k}"
+        pythonpath: ["{worktree}", "{worktree}/python"]
+      validate:
+        cmd: "python3 {harness}/workloads/dak_gemm_multicast.py --variant multicast_prefill --validate --tokens {tokens} --m {m} --k {k}"
+        expect: ["^VALIDATION PASS$"]
       kernels: ["gemv_multicast_prefill"]
       cluster_size: 1
     - id: multicast
       role: dsmem
-      description: gemv_multicast - cluster 2, rank 0 TMA-multicasts each 8 KB weight tile into both CTAs, remote mbarrier arrive back-pressure
-      build: {cwd: third_party/DirectAccessKernel, cmd: "bash setup.sh && make pyext arch=90a"}
-      run:   {cwd: third_party/DirectAccessKernel, cmd: "python benchmark/benchmark_linear.py --type multicast --offload 0 --m {m} --k {k} --n {tokens} --graph  # with LinearMulticast.prefill=False and num_copy_blocks=132 (agent patch or script)"}
-      kernels: ["gemv_multicast"]
+      description: gemv_multicast - cluster 2 (__cluster_dims__), rank 0 TMA-multicasts each 64x64 fp16 (8 KB) weight tile into both CTAs, rank 1 releases the slot with a remote mbarrier arrive (LinearMulticast.prefill = False, num_copy_blocks = 132)
+      build:
+        cwd: third_party/DirectAccessKernel
+        patch: patches/dak_gemm_multicast__sync_fix.patch   # two upstream races fixed (CLAUDE.md change log, R3)
+        cmd: "export NVCC_APPEND_FLAGS=\"-I$CUTLASS_INCLUDE\" && make runtime.o .build_tile_n arch=90a TILE_N=8 && DAK_ARCH=90a DAK_TILE_N=8 MAX_JOBS=8 python3 setup.py build_ext --inplace && python3 -c 'import glob, sys; sys.exit(0 if glob.glob(\"python/offload/runtime*.so\") else 1)'"
+      run:
+        cmd: "python3 {harness}/workloads/dak_gemm_multicast.py --variant multicast --warmup {warmup} --iters {iters} --tokens {tokens} --m {m} --k {k}"
+        pythonpath: ["{worktree}", "{worktree}/python"]
+      validate:
+        cmd: "python3 {harness}/workloads/dak_gemm_multicast.py --variant multicast --validate --tokens {tokens} --m {m} --k {k}"
+        expect: ["^VALIDATION PASS$"]
+      kernels: ["gemv_multicast(?:<|\\(|$)"]
       cluster_size: 2
     - id: cublas
-      role: control
-      description: cuBLAS nn.Linear (--type vanila), reference throughput
-      build: {cwd: third_party/DirectAccessKernel, cmd: "bash setup.sh"}
-      run:   {cwd: third_party/DirectAccessKernel, cmd: "python benchmark/benchmark_linear.py --type vanila --m {m} --k {k} --n {tokens}"}
-      kernels: ["gemm|cutlass|sm90"]
+      role: reference
+      description: cuBLAS fp16 GEMM as nn.Linear runs it (torch.mm(X, W_t.t()), upstream --type vanila), extra marker for the attainable throughput; not part of the non_dsmem -> dsmem arrow (cuBLAS may itself pick clustered / multicast kernels)
+      build:
+        cwd: third_party/DirectAccessKernel
+        cmd: "export NVCC_APPEND_FLAGS=\"-I$CUTLASS_INCLUDE\" && make runtime.o .build_tile_n arch=90a TILE_N=8 && DAK_ARCH=90a DAK_TILE_N=8 MAX_JOBS=8 python3 setup.py build_ext --inplace && python3 -c 'import glob, sys; sys.exit(0 if glob.glob(\"python/offload/runtime*.so\") else 1)'"
+      run:
+        cmd: "python3 {harness}/workloads/dak_gemm_multicast.py --variant cublas --warmup {warmup} --iters {iters} --tokens {tokens} --m {m} --k {k}"
+        pythonpath: ["{worktree}", "{worktree}/python"]
+      validate:
+        cmd: "python3 {harness}/workloads/dak_gemm_multicast.py --variant cublas --validate --tokens {tokens} --m {m} --k {k}"
+        expect: ["^VALIDATION PASS$"]
+      kernels: ["nvjet|gemm|xmma|cutlass|splitKreduce"]
       cluster_size: null
 scope_layer: null
 measure: {reps: 100, warmup: 20, flush_l2: true}
 notes: >
-  Run with --offload 0 (all weights in HBM; host-offload paths target GH200 NVLink-C2C). tokens must be a
-  multiple of 512 so both CTAs of a cluster share a weight tile; pass num_copy_blocks=132 (NUM_SMS is
-  hard-coded to 132 in config.cuh, matching H100 NVL). gemv (gemv.cuh) is a different tiling, optional extra marker.
+  Built in the worktree (roofline/build/src/DirectAccessKernel__pin): runtime.o with the Makefile
+  (-gencode sm_90a -DDAK_SM_ARCH=90 -O3 -std=c++20), then the offload.runtime extension with
+  `setup.py build_ext --inplace` (python/offload/runtime*.so) instead of `make pyext`'s `pip install -e .`; CUTLASS from
+  the image ($CUTLASS_INCLUDE via NVCC_APPEND_FLAGS) instead of setup.sh's conda (setup.sh is not run). The wrapper
+  (roofline/harness/workloads/dak_gemm_multicast.py) builds the LinearMulticast layer (weights, TMA descriptors) and then
+  launches runtime.gemv_multicast / gemv_multicast_prefill directly with the layer's arguments: forward() also
+  allocates and zero-fills C per call (an extra kernel), which is not part of the GEMM; benchmark_linear.py (5 warm-up /
+  10 reps, own flush, defaults num_blocks = 32) is not used. All weights in HBM (upstream --offload 0).
+  Work split (gemv_multicast.cuh): grid = NUM_SMS = 132 CTAs of 320 threads (2 consumer warpgroups, 2 producer warps),
+  ~209 KB smem, 1 CTA/SM; each CTA owns m-tile pairs tile_im = blockId, blockId + B, ... with blockId = blockIdx / (tokens/256)
+  and B = (working CTAs) / (tokens/256). gemv_multicast takes B from gridDim (132) and returns early for blockIdx >= num_blocks,
+  so num_blocks must be 132 (smaller values leave tiles unwritten); gemv_multicast_prefill takes B from num_blocks = 128
+  (linearLayerMulticast.py:122). Both CTAs of a cluster must get the same blockId, hence tokens % 512 == 0. At the
+  listed shapes both variants run the same number of rounds per CTA (e.g. m = 4096: 32 m-tile pairs, B = 66/64 at
+  tokens 512 and 33/32 at tokens 1024), so the 132-vs-128 asymmetry does not change the work per CTA; tokens with
+  132 % (tokens/256) != 0 (e.g. 2048) would make gemv_multicast compute some tiles twice and are not used.
+  Upstream caveats of gemv_multicast (not patched): no named barrier between the consumer warpgroup's smem C write
+  and thread 0's TMA store (gemv_multicast_prefill has one), and no cluster barrier before exit while rank 1 still sends
+  remote mbarrier arrives to rank 0; validation repeats the GEMM 5 times to expose a race. The fp16 accumulator
+  (F16F16F16 atom) sets the tolerance. Role `reference` (cuBLAS) is not one of DESIGN 2.3's roles: the notebook must
+  leave it out of the arrow chain.

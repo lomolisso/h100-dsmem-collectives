@@ -157,4 +157,6 @@ workload,variant_id,role,scope,shape_id,rep,time_ns,wall_ns,flops,int_ops,hbm_by
   (−1.4 % on the 2 GiB write ceiling, more for outputs that fit L2).
 - Build commands actually used per artifact (the manifests' `build.cmd`, run by `run_manifest.py --stage build` in the
   per-(submodule, patch) worktree): CREDIT `make all CUDA_ARCH=sm_90a -j8` (+ `patches/credit__roofline_hooks.patch`, R2);
-  _others: R3–R7_
+  DAK `export NVCC_APPEND_FLAGS="-I$CUTLASS_INCLUDE" && make runtime.o .build_tile_n arch=90a TILE_N=8 && DAK_ARCH=90a
+  DAK_TILE_N=8 MAX_JOBS=8 python3 setup.py build_ext --inplace` (no `setup.sh`/conda; CUTLASS 4.4.2 from the image; R3);
+  _others: R4–R7_

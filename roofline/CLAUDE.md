@@ -125,3 +125,10 @@ per task. This section replaces steps 2–3 of `../CLAUDE.md` "Starting a new co
   `ROOFLINE_BLOCK_VARIANT=read|smem` benchmarks and verifies one one-CTA kernel (upstream keeps only the faster).
   Manifests: `flops` = FP32 operations per element as coded and `min_hbm_bytes` = compulsory traffic (both were
   wrong: the old bytes were CREDIT's `modeled_bytes()`, the read kernel's re-read traffic).
+- 2026-10-26 (R3) DAK `gemv_multicast` (the DSMEM variant; `patches/dak_gemm_multicast__sync_fix.patch`): two races fixed.
+  (1) No barrier between the consumer warpgroup's shared-memory writes of the output tile and thread 0's TMA store of
+  it (and no barrier before the tile buffer is reused) — `gemv_multicast_prefill` has both (`__sync_barrier<13/15>`).
+  (2) No cluster barrier before exit while the peer CTA still arrives remotely on the CTA's mbarriers: the unpatched
+  kernel validated (bit-identical repetitions) but failed with `LaunchFailed` under ncu kernel replay at every shape.
+  Fix: the two named barriers per warpgroup, and `__syncwarp(); cute::cluster_sync();` at kernel end. Cost 0.5–2.5 %
+  (e.g. llama_qo_t1024 52.34 → 52.83 µs, opt30b_fc1 464.3 → 475.9 µs). The non-DSMEM twin is unpatched.
