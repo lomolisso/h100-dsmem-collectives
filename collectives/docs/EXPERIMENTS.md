@@ -58,7 +58,7 @@ All times come from `%globaltimer` stamps written by the kernel (ns, consistent 
 | collective latency `L` | `max_r ts[r][exit] - min_r ts[r][entry]` (time until the slowest rank is done, measured from the moment the first rank entered) |
 | skew | `max_r L_r - min_r L_r`; also report `argmax`/`argmin` rank and their SM ids |
 | round latency `R_{r,k}` | `ts[r][2+k] - ts[r][2+k-1]` (round 0 from entry); shows which round dominates and whether the critical path moves between ranks |
-| payload per CTA `P` | bytes each CTA contributes: allreduce/allgather `M·B`, reducescatter/alltoall `N·M·B` (`B = sizeof(T)`) |
+| payload per CTA `P` | the data size of nccl-tests, per rank: allreduce `M·B` (its vector); allgather `N·M·B` (its full gathered output); reducescatter and alltoall `N·M·B` (its full input buffer); `B = sizeof(T)`. One standard for all ops, so allgather and its dual reducescatter, which move the same bytes, are comparable (until C6 the allgather payload was `M·B`, N× smaller; rows written before then carry that value in `payload_bytes`, the analysis recomputes `P` from op, N, M) |
 | algorithm bandwidth `algbw` | `P / L` (what the user of the collective perceives) |
 | bus bandwidth `busbw` | `algbw × f`, NCCL convention: allreduce `f = 2(N-1)/N`, allgather / reducescatter / alltoall `f = (N-1)/N`; comparable across ops and N |
 | bytes sent by rank `S_r` | from the file's docstring formula (README "total DSMEM bytes per CTA"; for rooted trees use the per-rank value) |
@@ -75,7 +75,7 @@ Report per configuration: median over reps of `L`, `algbw`, `busbw`; p10/p90 of 
 |---|---|
 | file | all 29 (skipping configurations illegal per `TESTING.md` §1) |
 | N | 2, 4, 8, 16 |
-| payload per CTA | 256 B, 1 KB, 4 KB, 16 KB, 64 KB, plus the largest payload that fits the 227 KiB per-CTA shared-memory limit (the `M_max` builds of `results/build_matrix_v2.csv`); choose `MSG_ELEMS` accordingly and record the cap per file and N |
+| payload per CTA | 256 B, 1 KB, 4 KB, 16 KB, 64 KB (allreduce `M = P/B`; allgather, reducescatter, alltoall `M = P/(N·B)`), plus the largest payload that fits the 227 KiB per-CTA shared-memory limit (the `M_max` builds of `results/build_matrix_v2.csv`); choose `MSG_ELEMS` accordingly and record the cap per file and N |
 | T | `float` (add `__half` only if a file supports it) |
 | reps | 20 warm-up + 200 timed launches per configuration; one process per configuration |
 

@@ -57,7 +57,8 @@ def load(sweep):
                 rid = r[h["run_id"]]
                 if rid > latest.get(key, ""):
                     latest[key] = rid
-                    data[key] = (rid, int(r[h["payload_bytes"]]), defaultdict(dict))
+                    data[key] = (rid, driver.payload_bytes(r[h["op"]], key[1], key[2], int(r[h["elem_bytes"]])),
+                                 defaultdict(dict))  # recomputed: allgather rows before C6 carry M*B
                 if rid != latest[key]:
                     continue
                 rank = data[key][2][int(r[h["rep"]])].setdefault(int(r[h["rank"]]), [0, 0, 0])

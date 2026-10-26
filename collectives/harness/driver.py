@@ -154,8 +154,13 @@ def grid(args):
 
 
 def payload_m(f, n, p):
-    """MSG_ELEMS for a payload of p bytes per CTA (float): allreduce/allgather M*B, reducescatter/alltoall N*M*B."""
-    return p // 4 if split(f)[0] in ("allreduce", "allgather") else p // (4 * n)
+    """MSG_ELEMS for a payload of p bytes per CTA (float), nccl-tests size: allreduce M*B, others N*M*B."""
+    return p // 4 if split(f)[0] == "allreduce" else p // (4 * n)
+
+
+def payload_bytes(op, n, m, b=4):
+    """Payload per CTA P (EXPERIMENTS §2, nccl-tests size): allreduce M*B, allgather/reducescatter/alltoall N*M*B."""
+    return m * b if op == "allreduce" else n * m * b
 
 
 def payload_points(args, lb):

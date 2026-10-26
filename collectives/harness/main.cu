@@ -84,7 +84,7 @@ constexpr const char* kOpName[] = {"allreduce", "allgather", "reducescatter", "a
 constexpr bool kReduce = OP == 0 || OP == 2;
 constexpr size_t kInElems = (OP == 0 || OP == 1) ? (size_t)N * M : (size_t)N * N * M;
 constexpr size_t kOutElems = (OP == 0 || OP == 2) ? (size_t)N * M : (size_t)N * N * M;
-constexpr size_t kPayloadBytes = ((OP == 0 || OP == 1) ? (size_t)M : (size_t)N * M) * sizeof(ELEM_T);
+constexpr size_t kPayloadBytes = (OP == 0 ? (size_t)M : (size_t)N * M) * sizeof(ELEM_T);  // nccl-tests size (EXPERIMENTS §2)
 constexpr bool kIsInt = std::is_same<ELEM_T, int>::value;
 static_assert(kIsInt || std::is_same<ELEM_T, float>::value, "ELEM_T must be float or int");
 constexpr size_t kSmemBytes = sizeof(CollectiveSmem);

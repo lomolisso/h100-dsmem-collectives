@@ -157,3 +157,9 @@ Follow `../CLAUDE.md` ("Starting a new conversation"): the task is the first row
   rounds: 1 (pull, reduce and push fused in one loop, one `st.round`), not "2 phases, 1 round each";
   `allreduce__rabenseifner__mpich` N constraint also needs N | M and 16-byte chunks. README note added on
   self-addressed cluster accesses (`bytes_self`). No code changed.
+- 2026-10-25 (C6, user decision): **payload definition → nccl-tests size for every op**. The allgather payload
+  per CTA was M·B (input), now N·M·B (gathered output), like its dual reducescatter; allreduce M·B and
+  reducescatter/alltoall N·M·B unchanged (EXPERIMENTS §2/§3). Harness: `main.cu` `kPayloadBytes`,
+  `driver.py payload_m/payload_bytes`, `perf_report.py` and the notebook module recompute P from op, N, M (allgather
+  stamp rows written before carry M·B in `payload_bytes`). The allgather sweep was topped up at the new payload
+  points (77 new configurations, correctness 231/231, both sweeps, ncu).
