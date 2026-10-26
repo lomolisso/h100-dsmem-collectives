@@ -35,6 +35,15 @@ TESTING §4–6 sanity checks, run largely on C5's data) is the gate that turns 
 project-internal status only: the notebook itself never says "preliminary" or mentions C4. C1's build-only steps can run before the microbench
 bring-up is done; its GPU smoke step cannot. This roadmap does not depend on `roofline/`.
 
+## Deferred (out of the current scope; consider only after C7, when the user asks)
+- **DSMEM-native variants** of the algorithms that synchronise with a `cluster_sync()` every round (ring AR/AG/RS,
+  recursive doubling AR/AG, Rabenseifner, Bruck AG/A2A, pairwise XOR, shift, recursive halving, the binomial
+  trees, ClusterFusion shift-accumulate bulk): same rounds, partners and messages, but per-round buffers and
+  pairwise "credit" mbarriers instead of the per-round cluster barrier, as new files (source tag `dsmem`) next to
+  the published/ported baselines, run through the same correctness → sweep → notebook pipeline. Motivation (C5):
+  at small messages the files without a barrier inside the collective are the fastest (e.g. N = 8, 4 KiB:
+  two-shot allreduce 0.93 µs vs ring 7.8 µs), so the current comparison partly measures synchronisation style.
+
 ## Shared facts for every task
 - The 29 files, grouped: **AllReduce (12)** `allreduce__{recursive_doubling__clusterfusion, shift_accumulate_bulk__clusterfusion, shift_accumulate_atomic__clusterfusion, direct_replicated_push__credit, pull_reduce_scatter_push_allgather__hpcops, ring__nccl, rabenseifner__mpich, one_shot_pull__trtllm, two_shot_push__trtllm, reduce_bcast_binomial__mpich, atomic_all_push__generic, 2d_mesh__generic}`;
   **AllGather (7)** `allgather__{recursive_doubling__clusterfusion, direct_shift__clusterfusion, direct_replicated_push__credit, ring__nccl, bruck__mpich, direct_pull__generic, gather_bcast_binomial__mpich}`;
