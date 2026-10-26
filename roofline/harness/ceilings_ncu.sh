@@ -19,12 +19,16 @@
 #   tc        python3 harness/ceilings_tc.py --ncu <config>, --profile-from-start off (only the GEMM between
 #             torch.cuda.profiler.start/stop is profiled), all its kernels summed: sm__inst_executed_pipe_tensor_op_hmma.sum
 #             and the gmma (wgmma) variant if listed
+#   tcpeak    bin/tc_peak ncu        -k regex:tc_peak   sm__inst_executed_pipe_tensor_op_gmma.sum (expected: 4 warps × the
+#             manifest's warpgroup-level wgmma_total, if ncu counts warp-level instructions) and the gmma pipe utilisation
+#             (sm__pipe_tensor_op_gmma_cycles_active.avg.pct_of_peak_sustained_active), one launch per kind (fp16, fp16acc,
+#             bf16, fp8) at N 256, 1 accumulator, wait_group 1, 2 warpgroups
 # → results/ceilings/ncu/<step>_<stamp>.ncu-rep, .raw.csv, ncu_<step>.csv (long format, harness/ceilings_ncu_post.py),
 #   query_metrics_<stamp>.txt.
-# Usage: harness/ceilings_ncu.sh [step ...]   steps: compute hbm dsmem tc (default: all)
+# Usage: harness/ceilings_ncu.sh [step ...]   steps: compute hbm dsmem tc tcpeak (default: all)
 set -euo pipefail
 cd "$(dirname "$0")/.."   # roofline/
-STEPS="${*:-compute hbm dsmem tc}"
+STEPS="${*:-compute hbm dsmem tc tcpeak}"
 want() { [[ " $STEPS " == *" $1 "* ]]; }
 B=harness/ceilings/bin
 OUT=results/ceilings/ncu
@@ -85,5 +89,10 @@ dram__bytes_read.sum")
     for cfg in fp16 bf16 fp8 fp8_fastacc; do
         prof "tc_$cfg" "$M" $OUT/manifest_tc.csv --aggregate --profile-from-start off -- python3 harness/ceilings_tc.py --ncu "$cfg"
     done
+fi
+if want tcpeak; then
+    M=$(available "$COMMON sm__inst_executed_pipe_tensor_op_gmma.sum sm__inst_executed.sum
+sm__pipe_tensor_op_gmma_cycles_active.avg.pct_of_peak_sustained_active sm__pipe_tensor_op_gmma_cycles_active.avg.pct_of_peak_sustained_elapsed")
+    prof tcpeak "$M" $OUT/manifest_tc_peak.csv "" -k regex:tc_peak -- $B/tc_peak ncu
 fi
 echo "ncu cross-checks done ($STAMP)"

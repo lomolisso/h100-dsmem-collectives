@@ -38,8 +38,8 @@ so a measured compute ceiling below them is expected; state both clocks in the n
 | L1/SMEM bandwidth | microbench 05 `bw_smem_l1.cu` `k12`: per-SM shared-memory read rate (iteration-slope method) × SM count (132) | — |
 | DSMEM bandwidth | aggregate microbenchmark vendored from microbench 11 (`k_stream`; user decision in the R0–R8 plan, instead of a new kernel): max active clusters at 1 CTA/SM, CS = 2…16, every CTA streaming from a peer (`ld.shared::cluster.v4` pull and bulk push), best CS and direction, cross-checked with the `dshared` byte counters. Independent of `../collectives/` | — |
 | FP32 CUDA-core peak | FMA-chain kernel, all SMs | 60 TFLOP/s |
-| FP16/BF16 tensor-core peak (dense) | large cuBLAS GEMM (8192³) best of 10 | 835.5 TFLOP/s dense (1671 with sparsity) |
-| FP8 tensor-core peak | cuBLASLt FP8 GEMM (`torch._scaled_mm`) best of 10 | 1670.5 TFLOP/s dense (3341 with sparsity) |
+| FP16/BF16 tensor-core peak (dense) | instruction throughput: back-to-back `wgmma` from shared memory (`harness/ceilings/src/tc_peak.cu`, R1 correction); cuBLAS GEMMs 2048–8192³ (kernel time) kept as lower references; plus the power-limited rate with random operands | 835.5 TFLOP/s dense (1671 with sparsity), quoted at 1545 MHz |
+| FP8 tensor-core peak | as FP16 (`wgmma` e4m3, m64nNk32); cuBLASLt FP8 GEMM (`torch._scaled_mm`) as reference | 1670.5 TFLOP/s dense (3341 with sparsity) |
 | INT32 peak | IMAD-chain kernel (for the top-k workload) | — |
 
 Each ceiling row carries `method` and `source` (`measured` or `datasheet`). The datasheet column is the H100 NVL (PNY /

@@ -22,6 +22,12 @@ launches flagged clock_bad / placement_bad (counted in n_flagged) and computes:
                (DESIGN: best of 10), 2·M·N·K / (ms_event − floor); median / p10 / p90 in the extra columns; rows with
                valid = 0 (correctness check failed) are not used; a config that could not run → value empty, source
                not_measured, the error in `method`
+  {fp16,fp16acc,bf16,fp8}_tc_peak_wgmma   tc_peak peak (back-to-back wgmma.mma_async, instruction-throughput ceiling):
+               per configuration (N, accumulators, wait_group, warpgroups, fill) the median of flop / (ms_event − floor) over
+               the unflagged launches; the configuration with the highest median (named in `method`, with the FLOP/clk/SM
+               from %clock64 against the architectural 4096 / 8192). fp16_tc_peak, bf16_tc_peak, fp8_tc_peak are then the
+               max of the torch/cuBLAS value above and the wgmma value(s) (fp16_tc_peak: fp16 and fp16acc wgmma, i.e. the
+               ceiling of every fp16-input GEMM whatever its accumulator); `method` names the winner
   datasheet rows (source = datasheet; H100 NVL, dense, boost clock)
 value = median over launches unless stated (tensor cores: best), p10 / p90 / n / n_flagged / source_run_ids as extra columns
 (DESIGN §5: the notebook reads name, value, unit, method, source by name). Mandatory columns: gpu_name, sm_count, cuda and
@@ -345,6 +351,16 @@ def main():
     rt = ";".join(rr.sort_values("started_iso").run_id) or None
     tcs = [read_run("tc.csv", r) for r in rr.run_id]
     tc = pd.concat([t for t in tcs if t is not None], ignore_index=True) if tcs else None
+    kbest = {}
+    kpath = f"{CEIL}/tc_kernel.csv"
+    if os.path.exists(kpath):
+        kd = pd.read_csv(kpath)
+        done = set(runs().query("complete").run_id)
+        kd = kd[kd.run_id.isin(done)]
+        for cfg, g in kd.groupby("config"):
+            i = g.flops_per_s.idxmax()
+            kbest[cfg] = (float(g.flops_per_s[i]), int(g["size"][i]), ",".join(map(str, sorted(g["size"].unique()))),
+                          str(g.kernel[i])[:40])
     if tc is not None and len(tc):
         S.note_src(tc)
         fp8 = []
@@ -367,9 +383,17 @@ def main():
             med, p10, p90, n = q(rate)
             best = float(rate.max())
             best_rid = str(g.run_id.loc[rate.idxmax()])
+            kb = kbest.get(cfg)
+            ev_note = ""
+            if kb is not None and kb[0] > best:  # kernel duration (nsys), the timer of the workload points
+                ev_note = (f"; kernel duration (nsys, ceilings_tc_kernel.py) of the best launch over sizes {kb[2]}: "
+                           f"{kb[0] / 1e12:.1f} T at {kb[1]}^3 (kernel {kb[3]}), above the event-timed best "
+                           f"{best / 1e12:.1f} T")
+                best = kb[0]
             m = int(g.m.iloc[0])
             meth = (f"{g.impl.iloc[0]}, {m}^3, best of {n} launches after 5 warm-ups (median {med / 1e12:.1f} T), "
-                    f"2*M*N*K / (event time - floor), best launch from run {best_rid}, max_rel_err {float(g.max_rel_err.iloc[0]):.1e}; LOCK")
+                    f"2*M*N*K / (event time - floor), best launch from run {best_rid}, max_rel_err {float(g.max_rel_err.iloc[0]):.1e}"
+                    f"{ev_note}; LOCK")
             S.add(name, best, "FLOP/s", meth, p10=p10, p90=p90, n=n, flagged=nf, rids=rt)
             if cfg.startswith("fp8"):
                 fp8.append((best, cfg, meth, p10, p90, n, nf))
@@ -381,6 +405,75 @@ def main():
     else:
         for name in ["fp16_tc_peak", "bf16_tc_peak", "fp8_tc_peak"]:
             S.add(name, np.nan, "FLOP/s", "no complete ceilings_tc.py run", "not_measured")
+
+    # ---- tensor cores, instruction throughput (tc_peak: back-to-back wgmma, operands in smem, accumulators in registers)
+    rw = latest_run("tc_peak", "peak", a.quick)
+    tw = read_run("tc_peak.csv", rw)
+    WG = [("fp16", "fp16_tc_peak_wgmma", 4096), ("fp16acc", "fp16acc_tc_peak_wgmma", 4096), ("bf16", "bf16_tc_peak_wgmma", 4096),
+          ("fp8", "fp8_tc_peak_wgmma", 8192)]  # architectural dense FLOP/clk/SM (H100 SXM 989.4 T = 132 x 1830 MHz x 4096)
+    if tw is not None and len(tw):
+        S.note_src(tw)
+        g, _ = good(tw)
+        g = g.copy()
+        g["rate"] = g.flop / ((g.ms_event - floor_ms) * 1e-3)
+        keys = ["n", "nacc", "wait_groups", "consumers", "fill"]
+        for kind, name, arch in WG:
+            d = g[g.kind == kind]
+            nf = int(((tw.kind == kind) & ((tw.clock_bad != 0) | (tw.placement_bad != 0))).sum())
+            if d.empty:
+                S.add(name, np.nan, "FLOP/s", f"{kind}: no unflagged tc_peak launch in run {rw}", "not_measured", flagged=nf, rids=rw)
+                continue
+            med_cfg = d.groupby(keys).rate.median().sort_values(ascending=False)
+            bk = med_cfg.index[0]
+            dd = d[np.logical_and.reduce([d[k] == v for k, v in zip(keys, bk)])]
+            med, p10, p90, n = q(dd.rate)
+            fpc, mhz = float(dd.flop_per_clk_sm.median()), float(dd.sm_mhz_blocks.median())
+            cfg = lambda k: f"N {k[0]} acc {k[1]} wait {k[2]} wg {k[3]} {k[4]}"
+            runners = "; ".join(f"{cfg(k)}: {v / 1e12:.1f}T" for k, v in list(med_cfg.items())[1:3])
+            S.add(name, med, "FLOP/s",
+                  f"tc_peak: back-to-back wgmma.mma_async.{dd.instr.iloc[0]} (A, B in smem by descriptor, 128B swizzle, K-major; "
+                  f"accumulators in registers), 1 CTA per SM on all {int(dd.blocks.iloc[0])} SMs; best of {len(med_cfg)} "
+                  f"configurations by median: {cfg(bk)} (next: {runners}); median of {n} launches, 2*64*N*K per wgmma / "
+                  f"(event time - {floor_ms * 1e3:.2f} us floor); {fpc:.0f} FLOP/clk/SM from %clock64 = {100 * fpc / arch:.1f} % "
+                  f"of the architectural {arch} at {mhz:.0f} MHz (block clock); LOCK", p10=p10, p90=p90, n=n, flagged=nf, rids=rw)
+        # Power-limited rate: the best configuration of each kind re-run with random finite operands; all of these
+        # launches ran below the lock (400 W limit), so they are flagged and kept out of the peak above. Their median
+        # rate is the sustained tensor-core rate with real data at this power limit (DESIGN §6, R1).
+        for kind, name, arch in WG:
+            rr_ = tw[(tw.kind == kind) & (tw.fill == "rand")]
+            if rr_.empty:
+                continue
+            rate = rr_.flop / ((rr_.ms_event - floor_ms) * 1e-3)
+            med, p10, p90, n = q(rate)
+            S.add(name.replace("_peak_wgmma", "_power_limited"), med, "FLOP/s",
+                  f"tc_peak with random finite operands (|x| < 2), best zero-operand configuration of {kind}: every launch "
+                  f"ran below the lock: in-kernel clock {rr_.sm_mhz_blocks.min():.0f}–{rr_.sm_mhz_blocks.max():.0f} MHz "
+                  f"(median {rr_.sm_mhz_blocks.median():.0f} MHz) at {rr_.flop_per_clk_sm.median():.0f} FLOP/clk/SM: the "
+                  f"400 W power limit, not the instruction rate, bounds dense tensor work with real data; median of {n} "
+                  f"launches (all clock-flagged, kept as such)", p10=p10, p90=p90, n=n, flagged=n, rids=rw)
+        src["tcpeak"] = rw
+    else:
+        for _, name, _ in WG:
+            S.add(name, np.nan, "FLOP/s", "no complete tc_peak peak run", "not_measured")
+    # fp16/bf16/fp8_tc_peak = max(torch/cuBLAS, wgmma); the cuBLAS rows above are left as computed, then replaced in place.
+    idx = {r[0]: i for i, r in enumerate(S.rows)}  # last row of each name
+    for peak, cands in [("fp16_tc_peak", ["fp16_tc_peak_wgmma", "fp16acc_tc_peak_wgmma"]), ("bf16_tc_peak", ["bf16_tc_peak_wgmma"]),
+                        ("fp8_tc_peak", ["fp8_tc_peak_wgmma"])]:
+        if peak not in idx:
+            continue
+        pr = S.rows[idx[peak]]
+        val = lambda r: r[1] if isinstance(r[1], (float, np.floating)) and np.isfinite(r[1]) else -np.inf
+        wrs = [S.rows[idx[c]] for c in cands if c in idx and np.isfinite(val(S.rows[idx[c]]))]
+        if not wrs:
+            continue
+        wb = max(wrs, key=val)
+        cub = f"{pr[1] / 1e12:.1f} T" if np.isfinite(val(pr)) else "not measured"
+        alts = ", ".join(f"{r[0]} {r[1] / 1e12:.1f} T" for r in wrs)
+        if val(pr) >= val(wb):
+            pr[3] = f"max(torch/cuBLAS {cub}, {alts}): torch/cuBLAS won; {pr[3]}"
+        else:
+            S.rows[idx[peak]] = [peak, wb[1], wb[2], f"max(torch/cuBLAS {cub}, {alts}): {wb[0]} won; {wb[3]}", wb[4], wb[5], wb[6],
+                                 wb[7], wb[8], wb[9]]
 
     for name, v, unit in DATASHEET:
         S.add(name, v, unit, "H100 NVL datasheet (per GPU, dense = half the with-sparsity tensor-core figure, boost clock)", "datasheet")
@@ -486,6 +579,24 @@ def crosschecks(S):
             if "gpu__time_duration.sum" in v:
                 add("tc_time", cfg, "gpu__time_duration.sum", v["gpu__time_duration.sum"], float(d.ms_event.iloc[0]) * 1e6,
                     f"ncu kernel time vs cudaEvent time of the profiled GEMM (ns); kernels: {names}", d.run_id.iloc[0])
+
+    tp = load_ncu("tcpeak")
+    if tp is not None:
+        for kind, d in tp.groupby("kind"):
+            v = d.groupby("metric").value.sum()
+            wg, rid = float(d.wgmma_total.iloc[0]), d.run_id.iloc[0]
+            m = "sm__inst_executed_pipe_tensor_op_gmma.sum"
+            if m in v:
+                add("tcpeak_gmma_inst", kind, m, v[m], 4 * wg,
+                    f"expected = 4 warps x warpgroup-level wgmma count (ratio 0.25 = counted once per warpgroup); "
+                    f"FLOP per counted instruction {float(d.flop.iloc[0]) / v[m]:.0f}", rid)
+            for pm in ["sm__pipe_tensor_op_gmma_cycles_active.avg.pct_of_peak_sustained_active",
+                       "sm__pipe_tensor_op_gmma_cycles_active.avg.pct_of_peak_sustained_elapsed"]:
+                if pm in v:
+                    add("tcpeak_gmma_util", kind, pm, v[pm], np.nan, "gmma pipe utilisation (%); informational", rid)
+            if "gpu__time_duration.sum" in v:
+                add("tcpeak_time", kind, "gpu__time_duration.sum", v["gpu__time_duration.sum"], float(d.ms_event.iloc[0]) * 1e6,
+                    "ncu kernel time vs cudaEvent time of the profiled launch (ns)", rid)
 
 
 def print_table(S, floor_ms):

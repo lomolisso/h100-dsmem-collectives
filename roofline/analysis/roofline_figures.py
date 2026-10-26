@@ -143,10 +143,18 @@ def lock_mhz(C):
     return int(C.loc["hbm_read_bw", "sm_clock_mhz"]) if "hbm_read_bw" in C.index else 1635
 
 
+# Architectural dense peak per SM per clock (GH100): FP32 128 FFMA = 256 FLOP; tensor cores 4096 FLOP (FP16/BF16)
+# and 8192 (FP8); INT32 IMAD issues at half the FFMA rate. HBM is not clock-scaled.
+PER_CLK_SM = {"fp32_peak": 256, "int32_peak": 128, "fp16_tc_peak": 4096, "bf16_tc_peak": 4096, "fp8_tc_peak": 8192}
+
+
 def table_ceilings(C=None):
-    """Measured ceilings next to the datasheet value, scaled to the locked SM clock for compute ceilings."""
+    """Measured ceilings next to the datasheet value and the architectural peak at the locked clock
+    (FLOP/clk/SM x 132 SMs x lock). The H100 NVL datasheet quotes FP32 at ~1775 MHz but tensor cores at 1545 MHz
+    (835.5 T = 132 x 4096 x 1545 MHz), so it is not scaled."""
     C = ceilings() if C is None else C
     lock = lock_mhz(C)
+    sms = int(C.loc["hbm_read_bw", "sm_count"]) if "hbm_read_bw" in C.index else 132
     rows = []
     for name, label in COMPUTE + MEMORY:
         if name not in C.index:
@@ -154,13 +162,13 @@ def table_ceilings(C=None):
         v, unit = float(C.loc[name, "value"]), C.loc[name, "unit"]
         ds = DATASHEET.get(name)
         dv = float(C.loc[ds, "value"]) if ds in C.index else np.nan
-        dlock = dv * lock / BOOST_MHZ if unit.endswith("/s") and "FLOP" in unit else dv
-        rows.append({"ceiling": label, "measured": v / 1e12, "unit": "T" + unit,
-                     "datasheet": dv / 1e12, "datasheet at lock": dlock / 1e12, "measured / datasheet at lock": v / dlock,
-                     "ridge vs HBM (FLOP/B)": v / float(C.loc["hbm_read_bw", "value"]) if "FLOP" in unit or "intop" in unit else np.nan})
+        arch = PER_CLK_SM[name] * sms * lock * 1e6 if name in PER_CLK_SM else (dv if name == "hbm_read_bw" else np.nan)
+        rows.append({"ceiling": label, "measured": v / 1e12, "unit": "T" + unit, "datasheet": dv / 1e12,
+                     "peak at lock": arch / 1e12, "measured / peak at lock": v / arch,
+                     "ridge vs HBM (op/B)": v / float(C.loc["hbm_read_bw", "value"]) if name in PER_CLK_SM else np.nan})
     t = pd.DataFrame(rows).set_index("ceiling")
-    return t.style.format({"measured": "{:.1f}", "datasheet": "{:.1f}", "datasheet at lock": "{:.1f}",
-                           "measured / datasheet at lock": "{:.0%}", "ridge vs HBM (FLOP/B)": "{:.1f}"}, na_rep="—")
+    return t.style.format({"measured": "{:.1f}", "datasheet": "{:.1f}", "peak at lock": "{:.1f}",
+                           "measured / peak at lock": "{:.0%}", "ridge vs HBM (op/B)": "{:.1f}"}, na_rep="—")
 
 
 def table_dsmem(C=None):
@@ -188,9 +196,10 @@ def fig_ceilings(C=None, save=None):
             continue
         v = float(C.loc[name, "value"])
         ax.plot(x, np.minimum(v, hbm * x), color=colors[name], lw=2, label=f"{label} {v / 1e12:.0f} T/s")
-        ds = DATASHEET.get(name)
-        if ds in C.index:
-            ax.axhline(float(C.loc[ds, "value"]), color=colors[name], ls=":", lw=1)
+        pl = name.replace("_peak", "_power_limited")
+        if pl in C.index:
+            vp = float(C.loc[pl, "value"])
+            ax.plot(x, np.minimum(vp, hbm * x), color=colors[name], lw=1.2, ls="--")
     for name, label in MEMORY[:-1]:
         if name in C.index:
             bw = float(C.loc[name, "value"])
@@ -201,7 +210,8 @@ def fig_ceilings(C=None, save=None):
     ax.text(0.012, hbm * 0.012 * 1.3, f"HBM {hbm / 1e12:.2f} TB/s", fontsize=8, rotation=37)
     ax.set(xscale="log", yscale="log", xlabel="operational intensity (FLOP or int op per HBM byte)",
            ylabel="throughput (FLOP/s or int op/s)", ylim=(1e10, 3e15), xlim=(1e-2, 1e4))
-    ax.legend(loc="lower right", fontsize=8, title=f"measured at {lock_mhz(C)} MHz; dotted: datasheet", title_fontsize=8)
+    ax.legend(loc="lower right", fontsize=8, title=f"measured at {lock_mhz(C)} MHz; dashed: power-limited (real data)",
+              title_fontsize=8)
     ax.grid(True, which="major", alpha=.3)
     _show(fig, save)
 
@@ -287,25 +297,31 @@ def abbr(w):
     return ABBR[w]
 
 
-def fig_roofline(L, workloads, shapes=None, title=None, save=None):
+def fig_roofline(L, workloads, shapes=None, title=None, save=None, one_panel=False):
     """Classic roofline (x = work per HBM byte), one panel per shape: one marker per role and arrows
     non-DSMEM -> control -> DSMEM per workload; the compute roof of the workloads' precision."""
     C, B = L["C"], L["markers"]
     B = B[(B.scope == "operator") & B.workload.isin(workloads)]
     shapes = shapes or list(dict.fromkeys(B.shape_id))
-    fig, axs = plt.subplots(1, len(shapes), figsize=(4.2 * len(shapes), 4.4), sharey=True, squeeze=False)
+    B = B[B.shape_id.isin(shapes)]
+    panels = [shapes] if one_panel else [[s_] for s_ in shapes]
+    fig, axs = plt.subplots(1, len(panels), figsize=(6.5 if one_panel else 4.2 * len(panels), 4.4), sharey=True,
+                            squeeze=False)
     hbm = float(C.loc["hbm_read_bw", "value"])
     lo, hi = np.nanmin(B.ai_hbm) / 2.5, np.nanmax(B.ai_hbm) * 40
     ylo, yhi = np.nanmin(B.throughput) / 3, None
     x = np.logspace(np.log10(lo), np.log10(hi), 200)
-    for ax, sh in zip(axs[0], shapes):
-        S = B[B.shape_id == sh]
+    for ax, sh in zip(axs[0], panels):
+        S = B[B.shape_id.isin(sh)]
         for p in sorted(set(S.precision.dropna())):
             roof = float(C.loc[PREC_CEIL[p], "value"])
             ax.plot(x, np.minimum(roof, hbm * x), color="0.2", lw=1.3)
+            pl = PREC_CEIL[p].replace("_peak", "_power_limited")
+            if pl in C.index:
+                ax.plot(x, np.minimum(float(C.loc[pl, "value"]), hbm * x), color="0.2", lw=1, ls="--")
             ax.text(hi / 1.3, roof * 1.12, f"{p.replace('_', ' ')} {roof / 1e12:.0f} T/s", fontsize=7, ha="right")
             yhi = max(yhi or 0, roof * 2)
-        for w, g in S.groupby("workload"):
+        for (w, s_), g in S.groupby(["workload", "shape_id"]):
             g = g.set_index("role")
             chain = [r for r in ROLE_ORDER if r in g.index]
             for a_, b_ in zip(chain, chain[1:]):
@@ -313,17 +329,18 @@ def fig_roofline(L, workloads, shapes=None, title=None, save=None):
                             xytext=(g.loc[a_, "ai_hbm"], g.loc[a_, "throughput"]),
                             arrowprops=dict(arrowstyle="->", color="0.6", lw=.8))
             if "dsmem" in g.index:
-                ax.annotate(abbr(w), (g.loc["dsmem", "ai_hbm"], g.loc["dsmem", "throughput"]), xytext=(3, -8),
+                ax.annotate(s_ if one_panel else abbr(w), (g.loc["dsmem", "ai_hbm"], g.loc["dsmem", "throughput"]), xytext=(3, -8),
                             textcoords="offset points", fontsize=7, color="C0")
         for role, st in ROLE_STYLE.items():
             h = S[S.role == role]
             if len(h):
                 ax.scatter(h.ai_hbm, h.throughput, s=26, zorder=3, label=role.replace("_", "-"), **st)
-        ax.set(xscale="log", yscale="log", xlim=(lo, hi), title=sh, xlabel="work per HBM byte")
+        ax.set(xscale="log", yscale="log", xlim=(lo, hi), title=None if one_panel else sh[0],
+               xlabel="work per HBM byte")
         ax.grid(True, which="major", alpha=.3)
-    axs[0][0].set(ylabel="throughput (work/s)", ylim=(ylo, yhi))
+    axs[0][0].set(ylabel="throughput (work/s)", ylim=(ylo, max(yhi or 0, np.nanmax(B.throughput) * 2)))
     axs[0][0].legend(fontsize=7, loc="upper left")
-    key = ", ".join(f"{abbr(w)} = {short_name(w)}" for w in sorted(set(B.workload)))
+    key = "" if one_panel else ", ".join(f"{abbr(w)} = {short_name(w)}" for w in sorted(set(B.workload)))
     fig.suptitle((title + "\n" if title else "") + key, fontsize=8)
     fig.tight_layout()
     _show(fig, save)
@@ -366,3 +383,33 @@ def table_flop_check(L, workloads):
     t.index = t.index.set_levels([t.index.levels[0].map(short_name), t.index.levels[1]])
     t = t[[r for r in ROLE_ORDER + ["reference"] if r in t.columns]]
     return t.style.format("{:.2f}", na_rep="—")
+
+
+LEVELS = [("hbm", "hbm_read_bw", "HBM"), ("l2", "l2_bw", "L2"), ("l1", "l1_smem_bw", "L1/SMEM"),
+          ("dsmem", "dsmem_bw", "DSMEM")]
+
+
+def fig_hierarchical(L, workload, shape, save=None):
+    """Hierarchical roofline of one workload at one shape: the same throughput against the intensity w.r.t. each
+    memory level, with that level's measured bandwidth and the compute roof of the workload's precision. A marker far
+    right of a level's ridge is not limited by that level."""
+    C, B = L["C"], L["markers"]
+    B = B[(B.scope == "operator") & (B.workload == workload) & (B.shape_id == shape)]
+    roof = float(C.loc[PREC_CEIL[B.precision.iloc[0]], "value"])
+    fig, axs = plt.subplots(1, len(LEVELS), figsize=(14, 3.6), sharey=True)
+    for ax, (lvl, ceil, label) in zip(axs, LEVELS):
+        bw = float(C.loc[ceil, "value"])
+        x = np.logspace(-2, 6, 300)
+        ax.plot(x, np.minimum(roof, bw * x), color="0.2", lw=1.3)
+        for role, st in ROLE_STYLE.items():
+            h = B[B.role == role]
+            if len(h):
+                ax.scatter(h[f"ai_{lvl}"].fillna(1e6), h.throughput, s=30, zorder=3, label=role.replace("_", "-"), **st)
+        ax.set(xscale="log", yscale="log", xlim=(1e-1, 1e6), title=f"{label} ({bw / 1e12:.1f} TB/s)",
+               xlabel=f"work per {label} byte")
+        ax.grid(True, which="major", alpha=.3)
+    axs[0].set(ylabel="throughput (work/s)", ylim=(np.nanmin(B.throughput) / 10, roof * 3))
+    axs[0].legend(fontsize=7)
+    fig.suptitle(f"{short_name(workload)}, {shape} (a level with no bytes is drawn at the right edge)", fontsize=9)
+    fig.tight_layout()
+    _show(fig, save)

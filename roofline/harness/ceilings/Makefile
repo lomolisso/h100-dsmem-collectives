@@ -5,8 +5,9 @@
 #   (.gitignore here). Rules, flags (-arch=sm_90a -O3 -lineinfo -std=c++17 -Xptxas -v -Xptxas -warn-spills) and the
 #   NVML/CUDA stub link come from the vendored common/h100mb/Makefile.inc.
 # Run everything on the GPU: roofline/tools/run --profile --lock-sm-mhz 1635 -- bash roofline/harness/ceilings/run_all.sh
-BINS := event_floor bw_hbm bw_l2 bw_smem dsmem_bw compute_peak
+BINS := event_floor bw_hbm bw_l2 bw_smem dsmem_bw compute_peak tc_peak
 include ../../../common/h100mb/Makefile.inc
 
 # local shared header (Makefile.inc's bin/% rule only lists the vendored headers)
 $(addprefix $(BIN_DIR)/,$(BINS)): src/ceil_common.hpp
+$(BIN_DIR)/tc_peak: src/wgmma_ops.hpp
