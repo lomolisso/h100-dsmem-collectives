@@ -1,10 +1,11 @@
-"""Data preparation, figures and tables for dsmem_collectives.ipynb (EXPERIMENTS.md §2, §6).
+"""Data preparation, network constants, cost model, figures and tables for dsmem_collectives.ipynb.
 
 The notebook only calls the functions below. Inputs are the local result files of the performance sweep
 (../results): stamps_<op>_s{1,2}.csv (one row per launch, rank and stamp), model.csv (per-rank traffic model),
 ncu.csv (Nsight Compute, mean of 5 launches per configuration) and collectives__runs.csv (run registry).
 prepare() streams the large stamp files once and caches compact tables in ../results/derived/ (pickles); load()
-returns them. Both sweeps are pooled: 2 x 200 timed launches per configuration.
+returns them. Both sweeps are pooled: 2 x 200 timed launches per configuration. fabric() reads the SM-to-SM network
+measurements of h100-microbench (07, 09, 11, 12; local summary CSVs).
 """
 import csv
 import glob
@@ -157,7 +158,140 @@ def load():
     return D
 
 
-# ---------------------------------------------------------------------------------------------------- style --
+# ------------------------------------------------------------------------------------- the SM-to-SM network --
+MB = Path(os.path.expanduser("~/work/fa2026/iacoma/h100-microbench/experiments"))
+CLK = 1.635  # SM cycles per ns at the 1635 MHz lock
+
+
+def _latest(rel):
+    d = pd.read_csv(MB / rel, low_memory=False)
+    return d[d.run_id == d.run_id.max()]
+
+
+def fabric():
+    """Network constants measured by h100-microbench 07, 09, 11, 12 (local summary CSVs, latest run of each)."""
+    s9 = _latest("09__dsmem_latency_vs_cluster_size/results/09__dsmem_latency__summary.csv")
+    s11 = _latest("11__dsmem_bandwidth_vs_cluster_size/results/11__dsmem_bw__summary.csv")
+    s12 = _latest("12__dsmem_atomics_and_async_stores/results/12__atomics__summary.csv")
+    s7 = _latest("07__synchronization_primitives/results/07__sync__summary_v2.csv")
+
+    def v9(level, cfg="cs 8"):
+        return float(s9[(s9.level == level) & (s9.config == cfg)]["median"].iloc[0])
+
+    def v12(op, kind):
+        r = s12[(s12.target == "dsmem") & (s12.cs.astype(str) == "2") & (s12.op == op) & (s12.kind == kind)]
+        return float(r.latency_cycles.iloc[0])
+
+    def v7(cfg):
+        return float(s7[(s7.level == "k2/cluster_sync/single") & (s7.config == cfg)]["median"].iloc[0])
+
+    lat = [  # (primitive, ns, source)
+        ("local shared-memory load", 23.0 / CLK, "09 k3: 23 cycles"),
+        ("remote shared-memory load (DSMEM)", v9("k1/ld_cluster/stride1/Default/remote") / CLK, "09 k1, CS 8"),
+        ("hand-off: bulk copy / st.async + mbarrier (one way)", v9("k2/st_async_mbarrier/r01/one_way_ns"), "09 k2"),
+        ("hand-off: plain store + flag poll (one way)", v9("k2/st_plain/r01/one_way_ns"), "09 k2"),
+        ("cluster barrier, idle (CS 8, 128-512 threads)", v7("cs 8, threads 128") / CLK, "07 k2: 360-511 cycles"),
+        ("cluster barrier after stores (release fence ≈ 520 cycles)", 545 / CLK, "07: release behind a store 520-550"),
+        ("remote atomic add.u32", v12("add.u32", "atom") / CLK, "12, CS 2"),
+        ("remote atomic add.f32 (compare-and-swap loop)", v12("add.f32", "atom") / CLK, "12, CS 2"),
+        ("issue of one bulk-copy command (≤ 1 KiB)", 65 / CLK, "11: issue-bound at ≈ 65 cycles"),
+    ]
+    ring = s11[s11.level.str.match(r"ring_(ld|st|st_async|tma_put)_cs\d+_single$")].copy()
+    ring["op"] = ring.level.str.extract(r"ring_(.+)_cs")[0]
+    ring["N"] = ring.level.str.extract(r"_cs(\d+)_")[0].astype(int)
+    ring["Bpc"] = ring.value.astype(float)
+    return {"lat": pd.DataFrame(lat, columns=["primitive", "ns", "source"]),
+            "ring": ring[["op", "N", "Bpc"]].sort_values(["op", "N"]),
+            "send_limit_Bpc": 21.33, "recv_limit_Bpc": 32.0}
+
+
+def table_fabric(F):
+    t = F["lat"].copy()
+    t["cycles"] = (t.ns * CLK).round(0).astype(int)
+    t["ns"] = t.ns.round(0).astype(int)
+    return t[["primitive", "cycles", "ns", "source"]].set_index("primitive")
+
+
+# ---------------------------------------------------------------------------------- synchronisation structure --
+def _l2(n):
+    return int(np.log2(n))
+
+
+SYNC = {  # file -> N -> (cluster barriers inside the timed region, mbarrier hand-off rounds); README / docstrings
+    "allreduce__two_shot_push__trtllm": lambda n: (0, 2),
+    "allreduce__2d_mesh__generic": lambda n: (0, 3 if n >= 4 else 2),
+    "allreduce__one_shot_pull__trtllm": lambda n: (2, 0),
+    "allreduce__direct_replicated_push__credit": lambda n: (2, 0),
+    "allreduce__pull_reduce_scatter_push_allgather__hpcops": lambda n: (2, 0),
+    "allreduce__atomic_all_push__generic": lambda n: (2, 0),
+    "allreduce__ring__nccl": lambda n: (2 * (n - 1), 2 * (n - 1)),
+    "allreduce__rabenseifner__mpich": lambda n: (2 * _l2(n), 2 * _l2(n)),
+    "allreduce__recursive_doubling__clusterfusion": lambda n: (_l2(n), _l2(n)),
+    "allreduce__reduce_bcast_binomial__mpich": lambda n: (2 * _l2(n), 2 * _l2(n)),
+    "allreduce__shift_accumulate_bulk__clusterfusion": lambda n: (n - 2, n - 2),
+    "allreduce__shift_accumulate_atomic__clusterfusion": lambda n: (2 * max(1, n - 2), 0),
+    "allgather__direct_replicated_push__credit": lambda n: (1, 0),
+    "allgather__direct_pull__generic": lambda n: (2, 0),
+    "allgather__recursive_doubling__clusterfusion": lambda n: (_l2(n), _l2(n)),
+    "allgather__bruck__mpich": lambda n: (int(np.ceil(np.log2(n))), int(np.ceil(np.log2(n)))),
+    "allgather__ring__nccl": lambda n: (n - 1, n - 1),
+    "allgather__direct_shift__clusterfusion": lambda n: (2 * (n - 1), n - 1),
+    "allgather__gather_bcast_binomial__mpich": lambda n: (2 * _l2(n), 2 * _l2(n)),
+    "reducescatter__direct_push__generic": lambda n: (0, 1),
+    "reducescatter__direct_pull__generic": lambda n: (2, 0),
+    "reducescatter__recursive_halving__mpich": lambda n: (_l2(n), _l2(n)),
+    "reducescatter__ring__nccl": lambda n: (n - 1, n - 1),
+    "alltoall__direct_push__generic": lambda n: (0, 1),
+    "alltoall__pairwise_exchange__fa4": lambda n: (0, 1),
+    "alltoall__direct_pull__generic": lambda n: (2, 0),
+    "alltoall__pairwise_xor__mpich": lambda n: (n - 1, n - 1),
+    "alltoall__shift__generic": lambda n: (n - 1, n - 1),
+    "alltoall__bruck__mpich": lambda n: (2 * _l2(n), _l2(n)),
+}
+STYLES = ["mbarrier only", "one exchange + cluster barriers", "cluster barrier every round"]
+STYLE_COLOR = dict(zip(STYLES, ["tab:blue", "tab:orange", "tab:red"]))
+
+
+def sync_style(f):
+    nb, nm = SYNC[f](8)
+    if nb == 0:
+        return STYLES[0]
+    return STYLES[1] if nm == 0 and nb <= 2 and "shift_accumulate" not in f else STYLES[2]
+
+
+def sync_fit(D, payload=256):
+    """Least-squares fit L = t0 + n_barrier·t_barrier + n_handoff·t_handoff over all non-atomic configurations at
+    `payload` (atomics excluded: their cost is the compare-and-swap loop, not synchronisation)."""
+    c = D["cfg"][(D["cfg"].payload == payload) & ~D["cfg"].alg.str.contains("atomic")].copy()
+    c[["nb", "nm"]] = [SYNC[f](n) for f, n in zip(c.file, c.N)]
+    X = np.c_[np.ones(len(c)), c.nb, c.nm]
+    coef, *_ = np.linalg.lstsq(X, c.L_med.values, rcond=None)
+    c["pred"] = X @ coef
+    c["style"] = [sync_style(f) for f in c.file]
+    r2 = 1 - ((c.L_med - c.pred) ** 2).sum() / ((c.L_med - c.L_med.mean()) ** 2).sum()
+    return {"t0": coef[0], "t_barrier": coef[1], "t_handoff": coef[2], "r2": r2, "n": len(c), "data": c,
+            "median_abs_err": float(np.median(np.abs(c.pred - c.L_med) / c.L_med))}
+
+
+def table_sync_fit(D, F):
+    s = sync_fit(D)
+    lat = F["lat"].set_index("primitive").ns
+    rows = [("fixed cost per collective", s["t0"], "—"),
+            ("one cluster barrier", s["t_barrier"],
+             f"{lat['cluster barrier, idle (CS 8, 128-512 threads)']:.0f} idle, "
+             f"{lat['cluster barrier after stores (release fence ≈ 520 cycles)']:.0f} after stores"),
+            ("one mbarrier hand-off", s["t_handoff"],
+             f"{lat['hand-off: bulk copy / st.async + mbarrier (one way)']:.0f}")]
+    t = pd.DataFrame(rows, columns=["cost", "fitted on the collectives (ns)", "measured on the network (ns)"])
+    t["fitted on the collectives (ns)"] = t["fitted on the collectives (ns)"].round(0).astype(int)
+    return t.set_index("cost")
+
+
+# ---------------------------------------------------------------------------------------------- plot helpers --
+plt.rcParams.update({"font.size": 10, "axes.spines.top": False, "axes.spines.right": False,
+                     "axes.grid": True, "grid.alpha": 0.25, "legend.frameon": False})
+
+
 def _show(fig):
     """Embed the figure as a PNG in a notebook (works with any matplotlib backend); plt.show() elsewhere."""
     try:
@@ -170,210 +304,195 @@ def _show(fig):
         return
     import io
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=90)
+    fig.savefig(buf, format="png", dpi=100, bbox_inches="tight")
     plt.close(fig)
     display(Image(data=buf.getvalue()))
-
-
-COLORS = list(plt.get_cmap("tab10").colors) + ["black", "goldenrod"]  # 12 distinct colours
-
-
-def _style(algs):
-    marks = "osD^v<>pPhX*"
-    return {a: (COLORS[i % len(COLORS)], marks[i % len(marks)]) for i, a in enumerate(sorted(algs))}
 
 
 def _bytes(v, _=None):
     return f"{v / 1024:g} KiB" if v >= 1024 else f"{v:g} B"
 
 
-def _axes(ax, x):
-    """Plain tick labels on log axes: x = 'N' (2, 4, 8, 16) or 'payload' (256 B … 64 KiB …)."""
-    if x == "N":
+def _logx(ax, kind):
+    ax.set_xscale("log")
+    if kind == "N":
         ax.set_xticks([2, 4, 8, 16])
         ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
     else:
-        ax.set_xticks(PAYLOADS + [262144])
+        ax.set_xticks([256, 1024, 4096, 16384, 65536, 262144])
         ax.xaxis.set_major_formatter(FuncFormatter(_bytes))
     ax.xaxis.set_minor_formatter(NullFormatter())
-    if ax.get_yscale() == "log":
-        ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
-        ax.yaxis.set_minor_formatter(NullFormatter())
 
 
-def _bw_optimal(D):
-    """Algorithms whose modelled traffic is minimal and balanced: every rank sends exactly the lower bound
-    (allreduce 2(N-1)/N·M·B, others (N-1)·M·B), evaluated at N = 8."""
-    m = D["model"]
-    out = set()
-    for (f, n, mm), g in m.groupby(["file", "N", "M"]):
-        if n != 8:
-            continue
-        op = f.split("__")[0]
-        bound = 2 * (n - 1) / n * mm * 4 if op == "allreduce" else (n - 1) * mm * 4
-        if abs(g.bytes_sent.max() - bound) < 1e-6 * bound:
-            out.add(f.split("__")[1] + "|" + op)
+def _logy(ax):
+    ax.set_yscale("log")
+    ax.yaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
+    ax.yaxis.set_minor_formatter(NullFormatter())
+
+
+SHORT = {"pull_reduce_scatter_push_allgather": "pull-RS/push-AG", "direct_replicated_push": "replicated push",
+         "shift_accumulate_bulk": "shift-accumulate", "shift_accumulate_atomic": "shift-acc. atomic",
+         "reduce_bcast_binomial": "reduce+bcast tree", "gather_bcast_binomial": "gather+bcast tree",
+         "recursive_doubling": "recursive doubling", "recursive_halving": "recursive halving",
+         "two_shot_push": "two-shot push", "one_shot_pull": "one-shot pull", "atomic_all_push": "atomic push",
+         "pairwise_exchange": "pairwise exchange", "pairwise_xor": "pairwise XOR", "direct_push": "direct push",
+         "direct_pull": "direct pull", "direct_shift": "direct shift", "2d_mesh": "2D mesh"}
+
+
+def _short(a):
+    return SHORT.get(a, a)
+
+
+def _best_per_style(d, key="L_med", best=min, axis="N"):
+    """Name of the best algorithm of each synchronisation style in d (by the median of `key` over d), among the
+    algorithms present at every value of `axis` in d (a fair comparison)."""
+    full = d.groupby("alg")[axis].nunique()
+    d = d[d.alg.isin(full[full == full.max()].index)]
+    out = {}
+    for st in STYLES:
+        g = d[[sync_style(f) == st for f in d.file]]
+        if len(g):
+            s = g.groupby("alg")[key].median()
+            out[st] = s.idxmin() if best is min else s.idxmax()
     return out
 
 
-# --------------------------------------------------------------------------------------------------- tables --
-def _sweep_runs():
-    runs = pd.read_csv(RES / "collectives__runs.csv")
-    done = set(runs[runs.status == "complete"].run_id)
-    s = runs[(runs.status == "started") & runs.cmdline.str.contains("--mode perf", regex=False) &
-             runs.cmdline.str.contains("--set perf", regex=False) & runs.run_id.isin(done)]
-    return sorted(s.run_id)
+def _label_ends(ax, items, log):
+    """Write each line's name at its right end, nudging labels apart vertically so they never overlap."""
+    items = sorted(items, key=lambda t: t[1])
+    lo, hi = ax.get_ylim()
+    gap = (np.log10(hi) - np.log10(lo)) * 0.07 if log else (hi - lo) * 0.06
+    placed = []
+    for x, y, text, col in items:
+        yy = np.log10(y) if log else y
+        if placed and yy < placed[-1] + gap:
+            yy = placed[-1] + gap
+        placed.append(yy)
+        ax.annotate(text, (x, 10 ** yy if log else yy), xytext=(5, 0), textcoords="offset points", fontsize=8,
+                    color=col, va="center")
 
 
-def table_setup(D):
-    meta = D["meta"]
-    keys = D["cfg"][["file", "N", "M"]]
-    L = D["launch"].merge(keys, on=["file", "N", "M"])  # launches of the configurations shown
-    rows = [("GPU", f"{meta.gpu.iloc[0]} (GPU 3, {meta.sm_count.iloc[0]} SMs)"),
-            ("Driver / CUDA runtime", f"{meta.driver.iloc[0]} / {meta.cuda.iloc[0]}"),
-            ("Toolchain", "nvcc 12.9.86, -arch=sm_90a -O3; Nsight Compute 2025.2.1"),
-            ("SM clock", f"locked at 1635 MHz (median sample {meta.sm_clock_med.median():.0f} MHz); memory "
-                         f"{meta.mem_clock.iloc[0]} MHz"),
-            ("Launch", "one cluster of N CTAs, 256 threads per CTA, dynamic shared memory up to 227 KiB per CTA"),
-            ("Configurations", f"{D['cfg'].shape[0]} (file × N × payload), float"),
-            ("Timed launches", f"{len(L)} (2 sweeps × 200 per configuration, randomised order, 20 warm-ups); "
-                               f"{int(L.clock_bad.sum())} discarded for a clock below the lock"),
-            ("Sweep run_ids", ", ".join(_sweep_runs())),
-            ("Timer", "%globaltimer, 32 ns resolution")]
-    return pd.DataFrame(rows, columns=["", "value"]).set_index("")
+# ------------------------------------------------------------------------------------------------- figures --
+def fig_fabric_costs(F):
+    t = F["lat"].iloc[::-1]
+    fig, ax = plt.subplots(figsize=(8, 3.6))
+    ax.barh(t.primitive, t.ns, color="0.55", height=0.6)
+    for y, v in enumerate(t.ns):
+        ax.text(v + 5, y, f"{v:.0f}", va="center", fontsize=9)
+    ax.set_xlabel("time (ns, SM clock 1635 MHz)")
+    ax.grid(axis="y", visible=False)
+    _show(fig)
 
 
-def table_latency_4k(D):
-    c = D["cfg"][D["cfg"].payload == 4096]
-    t = c.pivot_table(index=["op", "alg"], columns="N", values="L_med") / 1000
-    return t.round(2).rename_axis(columns="N →  median L (µs) at 4 KiB per CTA")
+def fig_fabric_bandwidth(F):
+    r = F["ring"]
+    fig, ax = plt.subplots(figsize=(6.5, 3.8))
+    names = {"tma_put": "bulk copy (TMA)", "st_async": "st.async", "st": "remote store", "ld": "remote load"}
+    for op, col in zip(["tma_put", "st_async", "st", "ld"], ["tab:blue", "tab:green", "tab:purple", "tab:gray"]):
+        g = r[r.op == op]
+        ax.plot(g.N, g.Bpc * CLK, marker="o", color=col, label=names[op])
+    ax.axhline(F["send_limit_Bpc"] * CLK, color="k", lw=1, ls="--")
+    ax.text(2, F["send_limit_Bpc"] * CLK + 0.6, "per-SM send limit 21.33 B/cycle", fontsize=9)
+    ax.axhline(F["recv_limit_Bpc"] * CLK, color="k", lw=1, ls=":")
+    ax.text(2, F["recv_limit_Bpc"] * CLK + 0.6, "per-SM receive limit ≈ 32 B/cycle", fontsize=9)
+    _logx(ax, "N")
+    ax.set(xlabel="cluster size N (all N SMs send to their ring neighbour at once)", ylabel="GB/s per SM",
+           ylim=(0, 58))
+    ax.legend(loc="lower left", ncol=2)
+    _show(fig)
 
 
-def table_best(D, metric="latency"):
-    c = D["cfg"][D["cfg"].payload.isin(PAYLOADS)]
-    key = "L_med" if metric == "latency" else "busbw"
-    idx = c.groupby(["op", "N", "payload"])[key].idxmin() if metric == "latency" else \
-        c.groupby(["op", "N", "payload"])[key].idxmax()
-    b = c.loc[idx]
-    val = (b.L_med / 1000).round(2).astype(str) + " µs" if metric == "latency" else b.busbw.round(1).astype(str) + " GB/s"
-    b = b.assign(cell=b.alg + " (" + val + ")")
-    t = b.pivot_table(index=["op", "N"], columns="payload", values="cell", aggfunc="first")
-    t.columns = [f"{p // 1024} KiB" if p >= 1024 else f"{p} B" for p in t.columns]
-    return t.reindex(OPS, level=0)
-
-
-# -------------------------------------------------------------------------------------------------- figures --
-def _panels(title):
-    fig, axes = plt.subplots(2, 2, figsize=(14, 9.5))
-    fig.suptitle(title, fontsize=12)
-    return fig, dict(zip(OPS, axes.flat))
+def fig_sync_fit(D):
+    s = sync_fit(D)
+    c = s["data"]
+    fig, ax = plt.subplots(figsize=(5.6, 5.2))
+    for st in STYLES:
+        g = c[c["style"] == st]
+        ax.scatter(g.pred / 1000, g.L_med / 1000, s=22, color=STYLE_COLOR[st], label=st, alpha=0.8)
+    lim = [0.12, 25]
+    ax.plot(lim, lim, color="k", lw=0.8)
+    _logy(ax)
+    ax.set_xscale("log")
+    ax.xaxis.set_major_formatter(FuncFormatter(lambda v, _: f"{v:g}"))
+    ax.set(xlim=lim, ylim=lim, xlabel="predicted: t0 + barriers·t_barrier + hand-offs·t_handoff (µs)",
+           ylabel="measured median latency (µs)")
+    ax.set_title(f"256 B per CTA, all N; R² = {s['r2']:.2f}", fontsize=10)
+    ax.legend(loc="upper left")
+    _show(fig)
 
 
 def fig_latency_vs_n(D, payload=4096):
     c = D["cfg"][D["cfg"].payload == payload]
-    fig, ax = _panels(f"Collective latency vs cluster size, payload {payload // 1024} KiB per CTA "
-                      "(median, band = p10–p90)")
-    for op in OPS:
+    fig, axes = plt.subplots(1, 4, figsize=(16, 3.8), sharey=True)
+    for ax, op in zip(axes, OPS):
         d = c[c.op == op]
-        sty = _style(d.alg.unique())
+        best = _best_per_style(d)
+        labels = []
         for alg, g in d.groupby("alg"):
             g = g.sort_values("N")
-            col, mk = sty[alg]
-            ax[op].plot(g.N, g.L_med / 1000, marker=mk, color=col, label=alg, lw=1.3)
-            ax[op].fill_between(g.N, g.L_p10 / 1000, g.L_p90 / 1000, color=col, alpha=.12)
-        ax[op].set(title=op, xscale="log", yscale="log", xlabel="cluster size N", ylabel="L (µs)")
-        _axes(ax[op], "N")
-        ax[op].grid(alpha=.3, which="both")
-        ax[op].legend(fontsize=7, ncol=2)
-    fig.tight_layout()
+            if alg in best.values():
+                st = sync_style(g.file.iloc[0])
+                ax.plot(g.N, g.L_med / 1000, marker="o", color=STYLE_COLOR[st], lw=2, zorder=3)
+                labels.append((g.N.iloc[-1], g.L_med.iloc[-1] / 1000, _short(alg), STYLE_COLOR[st]))
+            else:
+                ax.plot(g.N, g.L_med / 1000, color="0.75", lw=1, zorder=1)
+        _logx(ax, "N")
+        _logy(ax)
+        _label_ends(ax, labels, log=True)
+        ax.set(title=op, xlabel="cluster size N", xlim=(1.8, 60))
+    axes[0].set_ylabel(f"median latency (µs), {_bytes(payload)} per CTA")
+    handles = [plt.Line2D([], [], color=STYLE_COLOR[s], lw=2) for s in STYLES] + [plt.Line2D([], [], color="0.75")]
+    fig.legend(handles, [f"best with {s}" for s in STYLES] + ["other algorithms"], loc="lower center", ncol=4,
+               bbox_to_anchor=(0.5, -0.08))
     _show(fig)
 
 
-def fig_latency_vs_payload(D, n=8):
+def fig_busbw(D, n=8):
     c = D["cfg"][D["cfg"].N == n]
-    fig, ax = _panels(f"Collective latency vs payload per CTA, N = {n} (open marker = largest payload that fits)")
-    for op in OPS:
+    lim = 21.33 * CLK
+    fig, axes = plt.subplots(1, 4, figsize=(16, 3.8), sharey=True)
+    for ax, op in zip(axes, OPS):
         d = c[c.op == op]
-        sty = _style(d.alg.unique())
+        grid = d[d.payload.isin(PAYLOADS)]
+        full = grid.groupby("alg").payload.nunique()  # algorithms present at every payload; best = highest at 64 KiB
+        best = _best_per_style(grid[grid.alg.isin(full[full == full.max()].index) & (grid.payload == 65536)],
+                               key="busbw", best=max, axis="payload")
+        labels = []
         for alg, g in d.groupby("alg"):
             g = g.sort_values("payload")
-            col, mk = sty[alg]
-            ax[op].plot(g.payload, g.L_med / 1000, marker=mk, color=col, label=alg, lw=1.3)
-            mx = g[g.is_max]
-            ax[op].plot(mx.payload, mx.L_med / 1000, marker=mk, color=col, mfc="white", ms=8, ls="none")
-        ax[op].set(title=op, xscale="log", yscale="log", xlabel="payload per CTA", ylabel="L (µs)")
-        _axes(ax[op], "payload")
-        ax[op].grid(alpha=.3, which="both")
-        ax[op].legend(fontsize=7, ncol=2)
-    fig.tight_layout()
+            if alg in best.values():
+                st = sync_style(g.file.iloc[0])
+                ax.plot(g.payload, g.busbw, marker="o", color=STYLE_COLOR[st], lw=2, zorder=3)
+                labels.append((g.payload.iloc[-1], g.busbw.iloc[-1], _short(alg), STYLE_COLOR[st]))
+            else:
+                ax.plot(g.payload, g.busbw, color="0.75", lw=1, zorder=1)
+        ax.axhline(lim, color="k", ls="--", lw=1)
+        _logx(ax, "payload")
+        ax.set_xticks([256, 4096, 65536])
+        ax.set(title=op, xlabel="payload per CTA", xlim=(200, 3e6), ylim=(0, 38))
+        _label_ends(ax, labels, log=False)
+    axes[0].text(260, lim + 0.8, "per-SM send limit", fontsize=8)
+    axes[0].set_ylabel(f"bus bandwidth (GB/s), N = {n}")
+    handles = [plt.Line2D([], [], color=STYLE_COLOR[s], lw=2) for s in STYLES] + [plt.Line2D([], [], color="0.75")]
+    fig.legend(handles, [f"best with {s}" for s in STYLES] + ["other algorithms"], loc="lower center", ncol=4,
+               bbox_to_anchor=(0.5, -0.08))
     _show(fig)
 
 
-def fig_busbw_vs_payload(D, n=8):
-    c = D["cfg"][D["cfg"].N == n]
-    opt = _bw_optimal(D)
-    fig, ax = _panels(f"Bus bandwidth vs payload per CTA, N = {n} (solid = traffic-optimal algorithm, "
-                      "dashed = moves more than the minimum or unevenly)")
-    for op in OPS:
-        d = c[c.op == op]
-        sty = _style(d.alg.unique())
-        for alg, g in d.groupby("alg"):
-            g = g.sort_values("payload")
-            col, mk = sty[alg]
-            ax[op].plot(g.payload, g.busbw, marker=mk, color=col, label=alg, lw=1.6 if f"{alg}|{op}" in opt else 1,
-                        ls="-" if f"{alg}|{op}" in opt else "--")
-        ax[op].set(title=op, xscale="log", xlabel="payload per CTA", ylabel="bus bandwidth (GB/s)")
-        _axes(ax[op], "payload")
-        ax[op].grid(alpha=.3, which="both")
-        ax[op].legend(fontsize=7, ncol=2)
-    fig.tight_layout()
-    _show(fig)
-
-
-def fig_rank_timeline(D):
-    t = D["timeline"]
-    fig, ax = _panels("One median launch per op, N = 8, 4 KiB per CTA: entry (|), end of each round (•), exit (▶) "
-                      "per rank")
-    for op in OPS:
-        d = t[t.op == op]
-        if d.empty:
-            continue
-        t0 = d[d.stamp == "entry"].t.min()
-        for r, g in d.groupby("rank"):
-            s = dict(zip(g.stamp, g.t - t0))
-            rounds = sorted((int(k[5:]), v) for k, v in s.items() if k.startswith("round"))
-            xs = [s["entry"]] + [v for _, v in rounds] + [s["exit"]]
-            ax[op].plot(xs, [r] * len(xs), color="0.6", lw=1, zorder=1)
-            ax[op].scatter([s["entry"]], [r], marker="|", s=120, color="k", zorder=2)
-            ax[op].scatter([v for _, v in rounds], [r] * len(rounds), s=14, color="tab:blue", zorder=2)
-            ax[op].scatter([s["exit"]], [r], marker=">", s=40, color="tab:red", zorder=2)
-            ax[op].text(s["exit"], r, f"  SM {g.smid.iloc[0]}", va="center", fontsize=7)
-        ax[op].set(title=f"{op}: {d.alg.iloc[0]}", xlabel="ns since the first rank's entry", ylabel="rank",
-                   yticks=range(8))
-        ax[op].invert_yaxis()
-        ax[op].grid(alpha=.3, axis="x")
-    fig.tight_layout()
-    _show(fig)
-
-
-def fig_injection_bw(D, n=16, payload=16384):
-    inj = D["inj"]
-    m = D["model"][["file", "N", "M", "rank", "bytes_sent"]]
-    d = inj[inj.N == n].merge(m, on=["file", "N", "M", "rank"])
-    d["bw"] = d.bytes_sent / d.Lr                                 # bytes/ns = GB/s
-    fig, ax = _panels(f"Per-SM injection bandwidth = bytes a rank sends / its own latency L_r, N = {n} "
-                      f"(all ranks × launches)")
-    for op in OPS:
-        p = payload if (d[d.op == op].payload == payload).any() else d[d.op == op].payload.max()
-        dd = d[(d.op == op) & (d.payload == p) & (d.bytes_sent > 0)]
-        algs = sorted(dd.alg.unique(), key=lambda a: dd[dd.alg == a].bw.median())
-        ax[op].boxplot([dd[dd.alg == a].bw for a in algs], showfliers=False, vert=False)
-        ax[op].set_yticks(range(1, len(algs) + 1))
-        ax[op].set_yticklabels(algs, fontsize=8)
-        ax[op].set(title=f"{op}, {_bytes(p)} per CTA" + ("" if p == payload else f" ({_bytes(payload)} does not fit)"),
-                   xlabel="GB/s per rank")
-        ax[op].grid(alpha=.3, axis="x")
-    fig.tight_layout()
+def fig_allreduce_ring(D, n=8):
+    c = D["cfg"][(D["cfg"].op == "allreduce") & (D["cfg"].N == n)]
+    pick = [("two_shot_push", "tab:blue"), ("one_shot_pull", "tab:orange"), ("rabenseifner", "tab:red"),
+            ("ring", "tab:brown")]
+    fig, ax = plt.subplots(figsize=(6.5, 4))
+    for alg, col in pick:
+        g = c[c.alg == alg].sort_values("payload")
+        ax.plot(g.payload, g.L_med / 1000, marker="o", color=col, label=alg)
+        ax.plot(g.payload.iloc[-1], g.L_med.iloc[-1] / 1000, marker="o", mfc="white", ms=9, color=col)
+    _logx(ax, "payload")
+    _logy(ax)
+    ax.set(xlabel="payload per CTA (open marker: largest that fits in shared memory)",
+           ylabel=f"median latency (µs), allreduce, N = {n}")
+    ax.legend()
     _show(fig)
 
 
@@ -392,34 +511,84 @@ def traffic_table(D):
     return j
 
 
-def fig_traffic_vs_model(D):
+def fig_traffic_ratio(D):
     j = traffic_table(D)
-    fig, ax = plt.subplots(1, 2, figsize=(14, 5.8))
-    sty = {op: c for op, c in zip(OPS, ["tab:blue", "tab:orange", "tab:green", "tab:red"])}
-    for op, g in j.groupby("op"):
-        ax[0].scatter(g.bytes_sent, g.measured, s=12, color=sty[op], label=op, alpha=.7)
-    lim = [j[["bytes_sent", "measured"]].min().min() * 0.7, j[["bytes_sent", "measured"]].max().max() * 1.4]
-    ax[0].plot(lim, lim, "k--", lw=.8)
-    ax[0].set(xscale="log", yscale="log", xlim=lim, ylim=lim, xlabel="model: kernel-wide DSMEM bytes",
-              ylabel="measured (Nsight Compute) − baseline", title="All configurations")
-    ax[0].legend()
-    ax[0].grid(alpha=.3, which="both")
     j["label"] = j.op + ": " + j.alg
-    r = j.groupby("label").ratio.agg(["min", "max"]).sort_values("max")
-    ax[1].hlines(range(len(r)), r["min"], r["max"], color="0.4")
-    ax[1].scatter(r["min"], range(len(r)), s=12, color="k")
-    ax[1].scatter(r["max"], range(len(r)), s=12, color="k")
-    ax[1].axvline(1, color="k", ls="--", lw=.8)
-    ax[1].axvspan(0.9, 1.1, color="g", alpha=.08)
-    ax[1].set_yticks(range(len(r)))
-    ax[1].set_yticklabels(r.index, fontsize=8)
-    ax[1].set(xlabel="measured / model (range over N and payload)", title="Ratio per algorithm (shaded ±10 %)")
-    ax[1].grid(alpha=.3, axis="x")
-    fig.tight_layout()
+    r = j.groupby("label").ratio.agg(["median", "min", "max"]).sort_values("median")
+    fig, ax = plt.subplots(figsize=(7, 7))
+    y = np.arange(len(r))
+    col = ["tab:red" if m > 1.1 else "0.5" for m in r["median"]]
+    ax.hlines(y, r["min"], r["max"], color=col, lw=1.5)
+    ax.scatter(r["median"], y, color=col, s=25, zorder=3)
+    ax.axvline(1, color="k", lw=0.8)
+    ax.set_yticks(y)
+    ax.set_yticklabels(r.index, fontsize=8)
+    ax.set(xlabel="measured / modelled DSMEM bytes (dot: median, line: range over N and payload)")
+    ax.grid(axis="y", visible=False)
     _show(fig)
 
 
+# --------------------------------------------------------------------------------------------------- tables --
+def table_setup(D):
+    meta = D["meta"]
+    keys = D["cfg"][["file", "N", "M"]]
+    L = D["launch"].merge(keys, on=["file", "N", "M"])  # launches of the configurations shown
+    rows = [("GPU", f"{meta.gpu.iloc[0]} (GPU 3, {meta.sm_count.iloc[0]} SMs)"),
+            ("Driver / CUDA runtime", f"{meta.driver.iloc[0]} / {meta.cuda.iloc[0]}"),
+            ("Toolchain", "nvcc 12.9.86, -arch=sm_90a -O3; Nsight Compute 2025.2.1"),
+            ("SM clock", f"locked at 1635 MHz (median sample {meta.sm_clock_med.median():.0f} MHz); memory "
+                         f"{meta.mem_clock.iloc[0]} MHz"),
+            ("Launch", "one cluster of N CTAs, 256 threads per CTA, dynamic shared memory up to 227 KiB per CTA"),
+            ("Configurations", f"{D['cfg'].shape[0]} (algorithm × N × payload), float"),
+            ("Timed launches", f"{len(L)} (2 sweeps × 200 per configuration, randomised order, 20 warm-ups); "
+                               f"{int(L.clock_bad.sum())} discarded for a clock below the lock"),
+            ("Timer", "%globaltimer, 32 ns resolution")]
+    return pd.DataFrame(rows, columns=["", "value"]).set_index("")
+
+
+def table_best(D, metric="latency"):
+    c = D["cfg"][D["cfg"].payload.isin(PAYLOADS)]
+    key = "L_med" if metric == "latency" else "busbw"
+    idx = c.groupby(["op", "N", "payload"])[key].idxmin() if metric == "latency" else \
+        c.groupby(["op", "N", "payload"])[key].idxmax()
+    b = c.loc[idx]
+    val = (b.L_med / 1000).round(2).astype(str) + " µs" if metric == "latency" else b.busbw.round(1).astype(str) + " GB/s"
+    b = b.assign(cell=b.alg + " (" + val + ")")
+    t = b.pivot_table(index=["op", "N"], columns="payload", values="cell", aggfunc="first")
+    t.columns = [_bytes(p) for p in t.columns]
+    return t.reindex(OPS, level=0)
+
+
+def numbers(D, F):
+    """Every number quoted in the notebook text, computed here."""
+    c = D["cfg"]
+    s = sync_fit(D)
+    out = {"fit": s}
+    smax = D["model"].groupby(["file", "N", "M"]).bytes_sent.max().rename("smax").reset_index()
+    cc = c.merge(smax, on=["file", "N", "M"])
+    lim = F["send_limit_Bpc"] * CLK
+    out["send_limit_GBs"] = lim
+    out["peak"] = {n: {op: cc[(cc.op == op) & (cc.N == n)].sort_values("busbw").iloc[-1][["alg", "payload", "busbw"]]
+                       .to_dict() for op in OPS} for n in (8, 16)}
+    a = c[(c.op == "allreduce") & (c.N == 8)].set_index(["alg", "payload"]).L_med
+    out["ar8"] = a
+    j = traffic_table(D)
+    out["traffic_within10"] = int(((j.ratio - 1).abs() <= 0.1).sum())
+    out["traffic_n"] = len(j)
+    out["atomic"] = c[c.alg == "atomic_all_push"].pivot_table(index="N", columns="payload", values="L_med")
+    return out
+
+
+def _sweep_runs():
+    runs = pd.read_csv(RES / "collectives__runs.csv")
+    done = set(runs[runs.status == "complete"].run_id)
+    s = runs[(runs.status == "started") & runs.cmdline.str.contains("--mode perf", regex=False) &
+             runs.cmdline.str.contains("--set perf", regex=False) & runs.run_id.isin(done)]
+    return sorted(s.run_id)
+
+
 # ---------------------------------------------------------------------------------------- summary CSV files --
+
 def write_summaries(D):
     """results/summary_latency.csv and results/summary_bandwidth.csv (committed with the notebook)."""
     meta = D["meta"]
