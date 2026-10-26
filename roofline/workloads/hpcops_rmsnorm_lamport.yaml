@@ -1,33 +1,50 @@
 name: hpcops_rmsnorm_lamport
 paper: Tencent hpc-ops (fused AllReduce + RMSNorm, low-latency Lamport mode)
 model: residual-add + RMSNorm of numTokens x hidden bf16, the RMSNorm half of a multi-GPU fused op
-runnable: conditional
+# not measurable on one GPU (notes); no paper numbers exist, so nothing is plotted: the notebook lists it as
+# "not measurable" with the reason below
+runnable: false
 precision: fp32_cuda
 scope_operator:
   description: h = x + residual; y = h * rsqrt(mean(h^2)+eps) * gamma; hidden dimension split across a cluster per token
-  shapes:
+  shapes:   # entry.cc fuse_allreduce_rmsnorm_low_latency: hidden in {4096, 5120, 7168} only for the high-throughput op; the low-latency op needs hidden % 8 == 0
     t8_h7168:  {tokens: 8,  hidden: 7168}
     t32_h4096: {tokens: 32, hidden: 4096}
   flops: "tokens*hidden*6"
   min_hbm_bytes: "2*(3*tokens*hidden + hidden) + 2*tokens*hidden"
-  validate: {reference: "torch rmsnorm of (x + residual)", tolerance: "max abs 2e-2 bf16"}
+  validate: {reference: "n/a (not measurable on one GPU)", tolerance: "n/a"}
   variants:
     - id: cluster1
       role: non_dsmem
-      description: same kernel at cluster size 1 (automatic for >= 67 tokens, or patches/hpcops_lamport__cluster_size_1.patch)
-      build: {cwd: third_party/hpc-ops, cmd: "git apply ../../roofline/patches/hpcops_lamport__cluster_size_1.patch && make sm90 && pip install dist/*.whl", patch: patches/hpcops_lamport__cluster_size_1.patch}
-      run:   {cwd: third_party/hpc-ops, cmd: "torch.ops.hpc.fuse_allreduce_rmsnorm_low_latency(..., world size 1) # agent script"}
+      description: rmsNormLamport at cluster size 1 (automatic for >= 67 tokens, or patches/hpcops_lamport__cluster_size_1.patch) - not built, see notes
+      build: {cwd: third_party/hpc-ops, patch: patches/hpcops_lamport__cluster_size_1.patch, cmd: "python3 {harness}/workloads/build_hpcops.py", env: {MAX_JOBS: "16", SM_ARCH: "90"}}
+      run:   {cmd: "echo 'hpcops_rmsnorm_lamport is not measurable on one GPU (manifest notes)'; exit 1"}
       kernels: ["rmsNormLamport"]
       cluster_size: 1
     - id: cluster_c
       role: dsmem
-      description: rmsNormLamport with cluster {1,c,1}, c = 8/4/2 for small token counts; replicated-push AllReduce of one float
-      build: {cwd: third_party/hpc-ops, cmd: "make sm90 && pip install dist/*.whl"}
-      run:   {cwd: third_party/hpc-ops, cmd: "torch.ops.hpc.fuse_allreduce_rmsnorm_low_latency(..., world size 1) # agent script"}
+      description: rmsNormLamport with cluster {1,c,1}, c = 8/4/2 for small token counts; replicated-push AllReduce of one float - not built, see notes
+      build: {cwd: third_party/hpc-ops, cmd: "python3 {harness}/workloads/build_hpcops.py", env: {MAX_JOBS: "16", SM_ARCH: "90"}}
+      run:   {cmd: "echo 'hpcops_rmsnorm_lamport is not measurable on one GPU (manifest notes)'; exit 1"}
       kernels: ["rmsNormLamport"]
       cluster_size: [8, 4, 2]
 scope_layer: null
 measure: {reps: 100, warmup: 20, flush_l2: true}
+reported: {}
 notes: >
-  Multi-GPU op (world size >= 2, NVLink Lamport buffers). Only runnable if the op accepts world size 1 on a
-  single GPU; otherwise skip and record why. Alternative baseline: rmsnorm_fusion=False + flashinfer.fused_add_rmsnorm.
+  Not measurable on one GPU without changing the algorithm (checked in R6 against hpc-ops 2a2e265):
+  (1) the only entry, torch.ops.hpc.fuse_allreduce_rmsnorm_low_latency, rejects world size 1:
+  src/allreduce/entry.cc:132 TORCH_CHECK(world_size >= 2 && world_size <= 64);
+  (2) the launcher instantiates the first kernel, twoshotAllreduceKernel<WorldSize>, only for nRanks in
+  {2, 4, 8, 16, 32, 64} and returns cudaErrorInvalidValue otherwise (fuse_allreduce_rmsnorm_low_latency.cu:342-363);
+  (3) rmsNormLamport has no input of its own: it reads the reduced tokens from the BROADCAST slot of the Lamport
+  buffer (cu:175-176) and spins until no -0.0 sentinel is left (cu:208-227); that slot is written only by
+  twoshotAllreduceKernel's broadcast store through the multicast (multimem) pointer (cu:40-41, 114), after
+  the scatter stage has received every peer rank's shard over NVLink P2P (scatter store cu:64-66, spin on the peers' shards cu:76-95); the buffers come from
+  hpc.empty_multimem / MulticastHandle over a MulticastCommunicator with one process per GPU
+  (tests/test_fuse_allreduce_rmsnorm_low_latency.py:32-68, world sizes 4 and 8, l.120-121). Running it would need
+  either >= 2 GPUs (the study has one) or a new launcher that pre-fills the Lamport buffer and flag state and calls
+  rmsNormLamport alone, i.e. a different program, not the artifact's op; neither is done (no faked multi-GPU
+  setup). No paper numbers exist, so `reported` is empty and nothing is plotted. Build commands are kept in the
+  runner's form for a future multi-GPU study; the runner skips runnable: false manifests. The RMSNorm-only DSMEM
+  pattern (scalar cluster AllReduce of the sum of squares) is measured by clusterfusion_rmsnorm instead.

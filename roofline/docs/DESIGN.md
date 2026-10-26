@@ -164,4 +164,5 @@ workload,variant_id,role,scope,shape_id,rep,time_ns,wall_ns,flops,int_ops,hbm_by
   DeepGEMM: symlink `third-party/{cutlass,deep_jit}` from the submodule into the worktree, link
   `deep_gemm/include/{cutlass,cute}`, `python3 setup.py build`, symlink `_C*.so` into `deep_gemm/` (develop.sh without the
   submodule update; R5); JIT cache `roofline/build/cache/deepgemm` (shared: the cache key includes the cluster size);
-  _others: R4, R6, R7_
+  hpc-ops `python3 {harness}/workloads/build_hpcops.py` (setup.py build_ext --inplace, SM_ARCH=90, -j16; R6);
+  _others: R4, R7_

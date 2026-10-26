@@ -1,42 +1,97 @@
 name: hpcops_topk_cluster8
 paper: Tencent hpc-ops (filtered top-k for LLM sampling)
-model: exact top-2048 index selection over a row of fp32 logits (radix select)
+model: exact top-2048 index selection over rows of n fp32 logits (radix select), m rows (decode batch)
 runnable: true
 precision: int32
 scope_operator:
-  description: coarse 2048-bin histogram, prefix-sum threshold, classify pass, candidate refinement; one row of n logits
-  shapes:
+  description: per row, exact 2048-bin coarse histogram of the fp16-projected keys, prefix-sum threshold, classify pass (selected / boundary candidates), fp32 radix refinement of the boundary bin; m rows of n logits
+  shapes:   # tests/test_topk.py test_cluster_uniform_rows (cluster section); ke = n for every row (uniform rows)
     m8_n32k:  {m: 8,  n: 32768,  k: 2048}
     m16_n64k: {m: 16, n: 65536,  k: 2048}
-    m8_n240k: {m: 8,  n: 244650, k: 2048}
-  int_ops: "m*n*8 + m*k*16"
-  min_hbm_bytes: "m*n*4*2 + m*k*4"
-  validate: {reference: "torch.topk indices (set equality per row), tests/test_topk.py", tolerance: "exact set"}
+    m8_n240k: {m: 8,  n: 244650, k: 2048}   # n % 4 == 2: every kernel runs its VEC = 2 instantiation
+  # Work = algorithmic integer ops of the exact radix select (one op = one 32-bit integer or bit operation on a key,
+  # index or counter, from topk_filtered.cu / topk_filtered_boundary.cuh; float compares and the fp32->fp16 F2F
+  # conversion are not integer ops), the same number for every variant:
+  #   scan 1, per logit: to_coarse_key = sign test (&0x8000), ^0xFFFF, &0x7FFF, select, >>5 (5) + the shared
+  #     histogram increment atomicAdd(&histogram[key], 1) (1) = 6;
+  #   scan 2, per logit: coarse_classify's common (dropped) path = FSETP (float, not counted) || fp32-bit equality
+  #     test (1) = 1;
+  #   per row: the k selected logits (second accepts test + output-cursor atomicAdd: 2 per logit) and the 2048-bin
+  #     histogram clear + prefix sum (2 per bin); boundary candidates and the fine rounds (tens of logits for random
+  #     rows) are not counted.
+  # Not checkable to 10 % against ncu, and not meant to be: sm__sass_thread_inst_executed_op_integer_pred_on counts
+  # SASS, i.e. also address and loop arithmetic, and each kernel encodes the algorithm differently. Static SASS of
+  # the cluster8 VEC=4 scan-1 loop (16 logits per iteration, 168 instructions): per logit 3.1 integer-class
+  # (LEA 1.4, ISETP 1.1, IMAD/VIADD/IADD3 0.7) + 5.0 bit-class (LOP3 3, PRMT 1, SHF 1) instructions next to F2F 1,
+  # ATOMS 1, LDG 0.25; the row-local kernel runs its scans in the __noinline__ run_exact_coarse_stage (another
+  # instruction schedule, call overhead) and the KV split scans the row once after a 1/64 sample. The ncu stage records op_integer (and op_bit, once the runner's
+  # METRICS list has it) per variant; the notebook reports counter / int_ops per variant as an implementation
+  # overhead, not as a validation of the formula.
+  int_ops: "m*n*(6 + 1) + m*(2*k + 2*2048)"
+  # logits read once (scan 2 re-reads them; at these sizes from L2: m*n*4 <= 7.8 MB < 60 MiB), indices written once
+  min_hbm_bytes: "m*n*4 + m*k*4"
+  validate:
+    reference: "torch.topk on the CPU (tests/test_topk.py _validate): per row, k valid unique in-range indices; index set equal to torch.topk's, or (ties) the sorted selected values equal torch.topk's sorted values"
+    tolerance: "exact (set equality per row, value equality under ties)"
   variants:
-    - id: kv_split_global
-      role: non_dsmem
-      description: row-local single-CTA kernel (n <= 131072) or KV-split kernel with global workspace, obtained by padding the row capacity to 17 rows with num_valid_rows = m
-      build: {cwd: third_party/hpc-ops, cmd: "make sm90 && pip install dist/*.whl"}
-      run:   {cwd: third_party/hpc-ops, cmd: "python - <<'EOF' # hpc.topk(logits[17,{n}], ke[17], out, num_valid_rows=[{m}], top_k=2048)"}
-      kernels: ["topk_filtered_row_local|topk_filtered_split_kernel"]
-      cluster_size: 1
-    - id: kv_split8_patched
-      role: control
-      description: exact 8-way KV-split analogue through global memory, via patches/hpcops_topk__use_cluster_false.patch (use_cluster = false)
-      build: {cwd: third_party/hpc-ops, cmd: "git apply ../../roofline/patches/hpcops_topk__use_cluster_false.patch && make sm90 && pip install dist/*.whl", patch: patches/hpcops_topk__use_cluster_false.patch}
-      run:   {cwd: third_party/hpc-ops, cmd: "python - <<'EOF' # hpc.topk(logits[{m},{n}], ke[{m}], out, num_valid_rows=[{m}], top_k=2048)"}
-      kernels: ["topk_filtered_split_kernel"]
-      cluster_size: 1
     - id: cluster8
       role: dsmem
-      description: topk_filtered_cluster8_exact_kernel - 8 CTAs per row, DSMEM histogram AllReduce (pull reduce-scatter + push all-gather) and rooted gather to rank 0
-      build: {cwd: third_party/hpc-ops, cmd: "make sm90 && pip install dist/*.whl"}
-      run:   {cwd: third_party/hpc-ops, cmd: "python - <<'EOF' # hpc.topk(logits[{m},{n}], ke[{m}], out, num_valid_rows=[{m}], top_k=2048)"}
+      description: topk_filtered_cluster8_exact_kernel<VEC, 2048, 8, 1024> - cluster of 8 CTAs (1024 threads) per row, each a contiguous n/8 segment; DSMEM AllReduce of the 2048-bin coarse histogram, peers publish selected-prefix / candidate counts by DSMEM atomics on rank 0 and rank 0 gathers the boundary candidates through DSMEM; rank 0 refines (choose_topk2048_plan -> kCluster8Exact for m <= 8 and n >= 32768 or m <= 16 and n >= 65536)
+      build: {cwd: third_party/hpc-ops, cmd: "python3 {harness}/workloads/build_hpcops.py", env: {MAX_JOBS: "16", SM_ARCH: "90"}}
+      run:
+        cmd: "python3 {harness}/workloads/hpcops_topk_cluster8.py --variant cluster8 --m {m} --n {n} --k {k} --warmup {warmup} --iters {iters}"
+        pythonpath: ["{worktree}"]
+        env: {HPC_SM_ARCH: "90"}
+      validate:
+        cmd: "python3 {harness}/workloads/hpcops_topk_cluster8.py --variant cluster8 --m {m} --n {n} --k {k} --validate"
+        expect: ["^setup: hpc from .*/hpc-ops__pin/hpc$", "^PLAN .*kernel=.*topk_filtered_cluster8_exact_kernel.* ok$", "^CHECK variant=cluster8 .* ok$", "^VALIDATION PASS$"]
       kernels: ["topk_filtered_cluster8_exact_kernel"]
       cluster_size: 8
+    - id: nocluster
+      role: non_dsmem
+      description: hpc-ops' own dispatch with the cluster route disabled (patches/hpcops_topk__use_cluster_false.patch; identical to what choose_topk2048_plan picks on GPUs with SM major < 9) - n <= 131072 one CTA (1024 threads) per row, topk_filtered_row_local_streaming_kernel<4, 2048, false, 1, 0> (same exact two-scan algorithm as cluster8, no split); n = 244650 the sampled 8-way KV split topk_filtered_split_kernel<2, 2048, 8, 64, 48> (8 CTAs of 512 threads per row, per-segment candidates and fine histograms through global memory, the last-arriving CTA merges and refines)
+      build: {cwd: third_party/hpc-ops, patch: patches/hpcops_topk__use_cluster_false.patch, cmd: "python3 {harness}/workloads/build_hpcops.py", env: {MAX_JOBS: "16", SM_ARCH: "90"}}
+      run:
+        cmd: "python3 {harness}/workloads/hpcops_topk_cluster8.py --variant nocluster --m {m} --n {n} --k {k} --warmup {warmup} --iters {iters}"
+        pythonpath: ["{worktree}"]
+        env: {HPC_SM_ARCH: "90"}
+      validate:
+        cmd: "python3 {harness}/workloads/hpcops_topk_cluster8.py --variant nocluster --m {m} --n {n} --k {k} --validate"
+        expect: ["^setup: hpc from .*/hpc-ops__hpcops_topk__use_cluster_false/hpc$", "^PLAN .*kernel=.*topk_filtered_(row_local_streaming|split)_kernel.* ok$", "^CHECK variant=nocluster .* ok$", "^VALIDATION PASS$"]
+      kernels: ["topk_filtered_row_local_streaming_kernel|topk_filtered_split_kernel"]
+      cluster_size: 1
+    - id: pad17
+      role: reference
+      description: unpatched library, row capacity padded to 17 (ke.numel() = 17, logits [17, n], num_valid_rows = m) so that use_cluster is false; at n <= 131072 the same kernel as nocluster (skipped), at n = 244650 the sampled 4-way KV split topk_filtered_split_kernel<2, 2048, 4, 64, 48> (m = 17 > 16 = max(16, 132/8) rows for 8 splits; 68 CTAs launched, the 36 of the padding rows exit at their first check). Extra marker, not in the non_dsmem -> dsmem arrow
+      build: {cwd: third_party/hpc-ops, cmd: "python3 {harness}/workloads/build_hpcops.py", env: {MAX_JOBS: "16", SM_ARCH: "90"}}
+      run:
+        cmd: "python3 {harness}/workloads/hpcops_topk_cluster8.py --variant pad17 --m {m} --n {n} --k {k} --warmup {warmup} --iters {iters}"
+        pythonpath: ["{worktree}"]
+        env: {HPC_SM_ARCH: "90"}
+      validate:
+        cmd: "python3 {harness}/workloads/hpcops_topk_cluster8.py --variant pad17 --m {m} --n {n} --k {k} --validate"
+        expect: ["^setup: hpc from .*/hpc-ops__pin/hpc$", "^PLAN .*kernel=.*topk_filtered_split_kernel.* ok$", "^CHECK variant=pad17 .* ok$", "^VALIDATION PASS$"]
+      kernels: ["topk_filtered_split_kernel"]
+      cluster_size: 1
+      skip:
+        m8_n32k: "same kernel as nocluster: m = 17 and m = 8 both dispatch to topk_filtered_row_local_streaming_kernel<4, 2048, false, 1, 0> (row_local_exact_max_n = 131072 for m < 32, m <= 132 SMs); the 9 padding CTAs return at blockIdx.x >= num_valid_rows"
+        m16_n64k: "same kernel as nocluster: m = 17 and m = 16 both dispatch to topk_filtered_row_local_streaming_kernel<4, 2048, false, 1, 0>; the padding CTA returns at blockIdx.x >= num_valid_rows"
 scope_layer: null
 measure: {reps: 100, warmup: 20, flush_l2: true}
 notes: >
-  Work is integer ops (int_ops; the formula is a model - replace by ncu sm__inst_executed counts) plotted
-  against the INT32 ceiling. Dispatch (choose_topk2048_plan, topk_filtered.cu:2860-2894) picks cluster8 for
-  m<=8 & n>=32768 or m<=16 & n>=65536; no flag exists to turn it off. Requires CUDA 12.9+, C++20.
+  Wrapper roofline/harness/workloads/hpcops_topk_cluster8.py; module built in place (hpc/_C_sm90.abi3.so of the
+  worktree, put on PYTHONPATH) by roofline/harness/workloads/build_hpcops.py = upstream setup.py build_ext --inplace
+  with SM_ARCH=90 and -j16 instead of setup.py's hard-coded -j64 (no wheel, no pip install). HPC_SM_ARCH=90 skips the
+  NVML probe of hpc/__init__.py. The wrapper passes preallocated counters (zeroed once; every kernel leaves them
+  zero) and workspace sized by hpc.topk_workspace_size of the loaded build, as tests/test_topk.py does - without
+  them topk_filtered_entry allocates and zero-fills both per call (an extra fill kernel). Dispatch reads only
+  (ke.numel(), n): use_cluster (topk_filtered.cu:2868) needs SM major >= 9, so the patched nocluster build is the
+  library's own non-cluster dispatch; with use_cluster false, m = 8/16 at n <= 131072 take the row-local kernel
+  (row_local_exact_max_n(m < 32) = 131072) and m = 8 at n = 244650 the 8-way KV split (choose_splits: n >= 131073,
+  m <= max(16, 132/8)); pad17 differs only at n = 244650 (4-way split, m = 17 <= 3*132/4). The KV-split route is
+  a different algorithm from cluster8 (a 1/64 systematic sample predicts the fp32 boundary, one scan writes candidate
+  ids and per-segment fine histograms to global memory, exact full-row fallback when the sample undershoots), so
+  neither KV-split marker is a DESIGN 2.3 control; the row-local kernel (nocluster at n <= 131072) runs the same
+  exact two-scan algorithm as cluster8 in one CTA per row. Role `reference` (pad17) stays out of the arrow chain.
+  Work is int_ops against the INT32 ceiling; see the int_ops comment for the definition and the ncu caveat.
+  Requires CUDA 12.9+, C++20.
