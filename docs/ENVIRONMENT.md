@@ -19,7 +19,7 @@ adds what is specific to this repository. Facts dated 2026-10-25.
   run_ids of microbench experiments 02/03 (`h100-microbench/experiments/03__sm_gpc_topology/results/03__sm_gpc_topology__map.csv`,
   rows whose `notes` carry serial 1793225008254). The GPU-2 values in `h100-microbench/AGENTS.md` are not
   valid for GPU 3 until re-checked.
-- **GPU-3 bring-up done 2026-10-25** (microbench commit `89ff996`, row `in review`): lock **1635 MHz** confirmed for
+- **GPU-3 bring-up done 2026-10-25** (microbench commit `89ff996`; row `done` in `h100-microbench/AGENTS.md`, checked 2026-10-26): lock **1635 MHz** confirmed for
   GPU 3; GPU-3 SM→GPC map = map run `2026-10-25T19:56:47.043+00:00` of the file above, identical to the GPU-2 map
   (8 GPCs 12/16/16/16/18/18/18/18, SMs 124–131 only in clusters ≤ 2, 7 GPCs host CS 16); its `partition`/`subnode`
   columns are empty (microbench 08 not re-run on GPU 3).
@@ -64,8 +64,10 @@ Rules for the derived image:
 - Built only by R0's build script (content-hash tag, ≥ 40 GB free check, never prunes, removes only our own
   previous roofline tags). Its entrypoint is the microbench one (GPU UUID check, clock lock, capability drop),
   so do not override `ENTRYPOINT`.
-- The `H100MB_IMAGE` override in `h100-microbench/tools/common.sh` (one line, added by R0) is honoured by
-  `tools/run` only; `tools/env build` must keep building the microbench image.
+- The `H100MB_IMAGE` override is one line in `h100-microbench/tools/run` (microbench commit `8f8fc7b`, added by
+  roofline R0), so only `tools/run` honours it; `tools/env build` keeps building the microbench image.
+- The derived image blanks the inherited `h100mb.owner` label and carries `roofline.owner` instead:
+  `tools/env build` in h100-microbench removes every other image labelled `h100mb.owner=$USER`.
 - **Containers are `--rm`**: anything installed into the image's venv at run time is lost. Heavy Python
   dependencies are baked into the image. Artifact extensions (ClusterFusion, DAK, DeepGEMM, hpc-ops) are
   built in-tree on NFS (`python setup.py build_ext --inplace`, or `pip install --no-deps --no-build-isolation

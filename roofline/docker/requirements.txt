@@ -1,0 +1,16 @@
+# Top-level Python packages the roofline image adds on top of the h100-microbench venv (/opt/venv).
+# Fully pinned in requirements.lock (resolved by `roofline/tools/build_image.sh lock`); never install at run time.
+# torch 2.11.0+cu129: meets hpc-ops (CXX11 ABI, >= 2.7), DeepGEMM (>= 2.3), flashinfer, CREDIT's baselines;
+# its headers still compile with -std=c++17 (ClusterFusion). Pins triton 3.6.0 and the CUDA 12.9 wheels.
+--extra-index-url https://download.pytorch.org/whl/cu129
+torch==2.11.0+cu129
+flashinfer-python==0.7.2.post1
+pyyaml
+pytest
+cmake>=3.26
+build
+wheel
+packaging
+ninja
+einops
+nvidia-ml-py

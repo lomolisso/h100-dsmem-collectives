@@ -127,7 +127,15 @@ workload,variant_id,role,scope,shape_id,rep,time_ns,wall_ns,flops,int_ops,hbm_by
 ## 6. Tooling  *(known values pre-filled; run-time values filled by R0/R1 and each workload task)*
 - Base image: h100-microbench `h100-microbench:cuda12.9.1-<hash>` (CUDA 12.9.1, nvcc 12.9.86, Nsight
   Compute 2025.2.1, Nsight Systems, Python 3.12); roofline image tag and Dockerfile: `roofline/docker/` (R0).
-- Driver / PyTorch / flashinfer / Triton versions: _TODO (R0)_
+- Roofline image (R0, 2026-10-26): `h100-roofline:cuda12.9.1-d08c91f3643b` (32.8 GB) `FROM`
+  `h100-microbench:cuda12.9.1-26d4f436f8c5`, built by `roofline/tools/build_image.sh build`; additions pinned in
+  `roofline/docker/requirements.lock` (intent: `requirements.txt`), CUTLASS 4.4.2 headers at `/opt/cutlass/include`
+  (`$CUTLASS_INCLUDE`, copied from `third_party/hpc-ops/3rd/cutlass` at hpc-ops `2a2e265`), `LIBRARY_PATH` = CUDA
+  driver stubs, `TORCH_CUDA_ARCH_LIST=9.0a`. JIT caches (`TORCH_EXTENSIONS_DIR`, `TORCHINDUCTOR_CACHE_DIR`,
+  `TRITON_CACHE_DIR`, `DG_JIT_CACHE_DIR`, `FLASHINFER_WORKSPACE_BASE`, `XDG_CACHE_HOME`) under
+  `roofline/build/cache/`, set by `roofline/tools/run`. Not installed: conda, CUDA 13, fairscale, FA4 dependencies.
+- Versions (R0 smoke on GPU 3): driver 580.126.20, CUDA 12.9.1 / nvcc 12.9.86, Nsight Compute 2025.2.1.0,
+  Python 3.12.3, PyTorch 2.11.0+cu129 (cuDNN 9.17.1), Triton 3.6.0, flashinfer-python 0.7.2.post1 (JIT kernels).
 - Clock state: SM clock locked by `tools/run --profile --lock-sm-mhz <LOCK>` on GPU 3 (value from
   h100-microbench `docs/context/10` §2), memory clock 2619 MHz, never changed. Value used: _TODO (R1)_
 - Exact ncu metric names used for each byte level (after `ncu --query-metrics`) and the DSMEM payload rule: _TODO (R1)_
