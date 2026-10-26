@@ -75,7 +75,8 @@ def configs(M=None, P=None):
     work, minb, prec = [], [], []
     for r in df.itertuples():
         m = M.get(r.workload)
-        so = m["scope_operator"] if m else {}
+        so = (m.get("scope_layer") or {} if r.scope == "layer" else m["scope_operator"]) if m else {}
+        so = dict(so, shapes=m["scope_operator"]["shapes"]) if m else so
         shape = so.get("shapes", {}).get(r.shape_id, {})
         p = r.cluster_size if r.cluster_size > 0 else 1
         w = _eval(so.get("flops"), shape, p) if so.get("flops") else _eval(so.get("int_ops"), shape, p)
@@ -214,3 +215,154 @@ def table_setup(C=None, P=None):
     if P is not None and len(P):
         rows["points rows"] = f"{len(P)} ({(P.rep >= 0).sum()} timed reps, {(P.rep == -1).sum()} counter rows)"
     return pd.DataFrame({"": rows}).style
+
+
+# ---------------------------------------------------------------- workload pairs
+ROLE_STYLE = {"non_dsmem": dict(color="0.45", marker="o"), "control": dict(color="C1", marker="s"),
+              "dsmem": dict(color="C0", marker="^"), "reference": dict(color="k", marker="x")}
+ROLE_ORDER = ["non_dsmem", "control", "dsmem"]
+PREC_CEIL = {"fp32_cuda": "fp32_peak", "fp16_tensor": "fp16_tc_peak", "bf16_tensor": "bf16_tc_peak",
+             "fp8_tensor": "fp8_tc_peak", "int32": "int32_peak"}
+
+
+def load():
+    """Everything the notebook needs: manifests, ceilings, points, per-configuration table, markers."""
+    M, C, P = manifests(), ceilings(), points()
+    D = configs(M, P)
+    return {"M": M, "C": C, "P": P, "D": D, "markers": best_p(D[D.scope == "operator"])}
+
+
+def short_name(w):
+    return w.replace("credit_", "").replace("_backward", " bwd").replace("_", " ")
+
+
+def pairs(B, workloads=None):
+    """One row per (workload, shape): the operator-scope markers of each role side by side."""
+    B = B[B.scope == "operator"]
+    if workloads is not None:
+        B = B[B.workload.isin(workloads)]
+    rows = []
+    for (w, s), g in B.groupby(["workload", "shape_id"], sort=False):
+        r = {"workload": w, "shape": s}
+        for role in ROLE_ORDER + ["reference"]:
+            h = g[g.role == role]
+            if len(h):
+                h = h.loc[h.time_ns.idxmin()]
+                for k in ["time_ns", "hbm_bytes", "dsmem_bytes", "throughput", "ai_hbm", "cluster_size", "variant_id",
+                          "work", "min_hbm_bytes"]:
+                    r[f"{role}.{k}"] = h[k]
+        rows.append(r)
+    return pd.DataFrame(rows)
+
+
+def table_pairs(D_or_load, workloads=None, elems=None):
+    L = D_or_load
+    T = pairs(L["markers"], workloads)
+    out = pd.DataFrame({
+        "workload": T.workload.map(short_name), "shape": T["shape"],
+        "non-DSMEM µs": T["non_dsmem.time_ns"] / 1e3,
+        "control µs": T.get("control.time_ns", np.nan) / 1e3,
+        "DSMEM µs": T["dsmem.time_ns"] / 1e3,
+        "best P": T["dsmem.cluster_size"].astype("Int64"),
+        "speedup vs non-DSMEM": T["non_dsmem.time_ns"] / T["dsmem.time_ns"],
+        "HBM bytes DSMEM / non-DSMEM": T["dsmem.hbm_bytes"] / T["non_dsmem.hbm_bytes"],
+        "HBM bytes DSMEM / compulsory": T["dsmem.hbm_bytes"] / T["dsmem.min_hbm_bytes"],
+        "HBM TB/s non-DSMEM": T["non_dsmem.hbm_bytes"] / T["non_dsmem.time_ns"] / 1e3,
+        "HBM TB/s DSMEM": T["dsmem.hbm_bytes"] / T["dsmem.time_ns"] / 1e3,
+        "DSMEM / HBM bytes": T["dsmem.dsmem_bytes"] / T["dsmem.hbm_bytes"],
+    })
+    return out.set_index(["workload", "shape"]).style.format(
+        {c: "{:.1f}" for c in ["non-DSMEM µs", "control µs", "DSMEM µs"]} |
+        {c: "{:.2f}" for c in ["speedup vs non-DSMEM", "HBM bytes DSMEM / non-DSMEM", "HBM bytes DSMEM / compulsory",
+                               "HBM TB/s non-DSMEM", "HBM TB/s DSMEM"]} | {"DSMEM / HBM bytes": "{:.3f}"}, na_rep="—")
+
+
+ABBR = {}
+
+
+def abbr(w):
+    """Short label of a workload for crowded plots (first letters of its words, e.g. 'layernorm bwd' -> 'LB')."""
+    if w not in ABBR:
+        ABBR[w] = "".join(t[0] for t in short_name(w).split()).upper()
+    return ABBR[w]
+
+
+def fig_roofline(L, workloads, shapes=None, title=None, save=None):
+    """Classic roofline (x = work per HBM byte), one panel per shape: one marker per role and arrows
+    non-DSMEM -> control -> DSMEM per workload; the compute roof of the workloads' precision."""
+    C, B = L["C"], L["markers"]
+    B = B[(B.scope == "operator") & B.workload.isin(workloads)]
+    shapes = shapes or list(dict.fromkeys(B.shape_id))
+    fig, axs = plt.subplots(1, len(shapes), figsize=(4.2 * len(shapes), 4.4), sharey=True, squeeze=False)
+    hbm = float(C.loc["hbm_read_bw", "value"])
+    lo, hi = np.nanmin(B.ai_hbm) / 2.5, np.nanmax(B.ai_hbm) * 40
+    ylo, yhi = np.nanmin(B.throughput) / 3, None
+    x = np.logspace(np.log10(lo), np.log10(hi), 200)
+    for ax, sh in zip(axs[0], shapes):
+        S = B[B.shape_id == sh]
+        for p in sorted(set(S.precision.dropna())):
+            roof = float(C.loc[PREC_CEIL[p], "value"])
+            ax.plot(x, np.minimum(roof, hbm * x), color="0.2", lw=1.3)
+            ax.text(hi / 1.3, roof * 1.12, f"{p.replace('_', ' ')} {roof / 1e12:.0f} T/s", fontsize=7, ha="right")
+            yhi = max(yhi or 0, roof * 2)
+        for w, g in S.groupby("workload"):
+            g = g.set_index("role")
+            chain = [r for r in ROLE_ORDER if r in g.index]
+            for a_, b_ in zip(chain, chain[1:]):
+                ax.annotate("", xy=(g.loc[b_, "ai_hbm"], g.loc[b_, "throughput"]),
+                            xytext=(g.loc[a_, "ai_hbm"], g.loc[a_, "throughput"]),
+                            arrowprops=dict(arrowstyle="->", color="0.6", lw=.8))
+            if "dsmem" in g.index:
+                ax.annotate(abbr(w), (g.loc["dsmem", "ai_hbm"], g.loc["dsmem", "throughput"]), xytext=(3, -8),
+                            textcoords="offset points", fontsize=7, color="C0")
+        for role, st in ROLE_STYLE.items():
+            h = S[S.role == role]
+            if len(h):
+                ax.scatter(h.ai_hbm, h.throughput, s=26, zorder=3, label=role.replace("_", "-"), **st)
+        ax.set(xscale="log", yscale="log", xlim=(lo, hi), title=sh, xlabel="work per HBM byte")
+        ax.grid(True, which="major", alpha=.3)
+    axs[0][0].set(ylabel="throughput (work/s)", ylim=(ylo, yhi))
+    axs[0][0].legend(fontsize=7, loc="upper left")
+    key = ", ".join(f"{abbr(w)} = {short_name(w)}" for w in sorted(set(B.workload)))
+    fig.suptitle((title + "\n" if title else "") + key, fontsize=8)
+    fig.tight_layout()
+    _show(fig, save)
+
+
+def fig_time_vs_bytes(L, workloads, title=None, save=None):
+    """Per (workload, shape): DSMEM / non-DSMEM time ratio against HBM-byte ratio. On the diagonal the DSMEM version
+    keeps the non-DSMEM version's achieved HBM bandwidth; above it, it loses bandwidth (time falls less than bytes)."""
+    T = pairs(L["markers"], workloads)
+    fig, ax = plt.subplots(figsize=(5.5, 5))
+    shapes = list(dict.fromkeys(T["shape"]))
+    for i, s in enumerate(shapes):
+        t = T[T["shape"] == s]
+        ax.scatter(t["dsmem.hbm_bytes"] / t["non_dsmem.hbm_bytes"], t["dsmem.time_ns"] / t["non_dsmem.time_ns"],
+                   color=f"C{i}", label=s, s=30, zorder=3)
+        for _, r in t.iterrows():
+            ax.annotate(abbr(r.workload), (r["dsmem.hbm_bytes"] / r["non_dsmem.hbm_bytes"],
+                                           r["dsmem.time_ns"] / r["non_dsmem.time_ns"]),
+                        xytext=(3, 2), textcoords="offset points", fontsize=7, color="0.4")
+    v = np.linspace(0.2, 2.6, 10)
+    ax.plot(v, v, color="0.6", ls="--", lw=1)
+    ax.axhline(1, color="0.8", lw=1)
+    ax.set(xlabel="HBM bytes, DSMEM / non-DSMEM", ylabel="time, DSMEM / non-DSMEM", title=title,
+           xlim=(0.3, 1.1), ylim=(0.5, 2.0))
+    ax.set_yscale("log")
+    ax.set_yticks([0.5, 0.6, 0.7, 0.8, 1, 1.2, 1.5, 2])
+    ax.yaxis.set_major_formatter(plt.matplotlib.ticker.FormatStrFormatter("%.1f"))
+    ax.yaxis.set_minor_formatter(plt.matplotlib.ticker.NullFormatter())
+    ax.legend(fontsize=8, title="shape", title_fontsize=8)
+    ax.grid(True, alpha=.3)
+    _show(fig, save)
+
+
+def table_flop_check(L, workloads):
+    """ncu-counted work of the marker configuration of every role / manifest formula (CUDA-core FP32 counters:
+    2·FFMA + FADD + FMUL); a ratio outside 0.9–1.1 needs the explanation given in the text."""
+    B = L["markers"]
+    B = B[(B.scope == "operator") & B.workload.isin(workloads)]
+    t = B.assign(ratio=B.flops_ncu / B.work).pivot_table(index=["workload", "shape_id"], columns="role", values="ratio")
+    t.index = t.index.set_levels([t.index.levels[0].map(short_name), t.index.levels[1]])
+    t = t[[r for r in ROLE_ORDER + ["reference"] if r in t.columns]]
+    return t.style.format("{:.2f}", na_rep="—")

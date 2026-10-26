@@ -36,16 +36,31 @@ reported:                                # only when runnable: false
 notes: <traps, caveats>
 ```
 
-Conventions the runner (`roofline/harness/run_manifest.py`, written in roadmap task R2) applies:
-- `build.cwd` / `run.cwd` name the submodule; the runner executes them in that variant's git worktree
-  `roofline/build/src/<manifest>__<variant>/` with `build.patch` applied there, never in `third_party/`.
-  Patch files are named `patches/<manifest>__<variant>.patch` (the initial five use shorter names; keep
-  them, the manifest field is what counts).
-- `build.cmd` must leave the result in the worktree or under `roofline/build/pyenv/<manifest>__<variant>`
-  (no `pip install` into the image venv: containers are `--rm`); `run.cmd` gets that prefix on `PYTHONPATH`.
-- Commands that need a wrapper (`# agent script` in the initial manifests) point to a script under
-  `roofline/harness/workloads/<manifest>.py` that runs exactly one iteration of the variant on `{shape}`.
-- Everything runs through `roofline/tools/run` (`../../docs/ENVIRONMENT.md`).
+Conventions the runner (`roofline/harness/run_manifest.py`, written in R2; its docstring is the reference) applies:
+- `build.cwd` names the submodule. The runner creates one git worktree per (submodule, patch) at the pinned
+  commit, `roofline/build/src/<repo>__<patch stem | pin>/`, applies `build.patch` there and runs `build.cmd` in
+  it (once per distinct command; a stamp file records it). Variants with the same submodule and patch share the
+  worktree. `third_party/` is never modified. `build.gpu: true` when the build needs a visible GPU (e.g.
+  ClusterFusion's `setup.py` reads the device architecture); `build.env` adds environment variables.
+- `build.cmd` leaves its result in the worktree or under `{pyenv}` = `roofline/build/pyenv/<repo>__<patch>`
+  (no `pip install` into the image venv: containers are `--rm`). `run.pythonpath: [...]` (formatted) is put on
+  `PYTHONPATH` in front of `roofline/harness`.
+- Commands are format strings over the shape keys plus `{P}` (one element of a `cluster_size` list; the runner
+  makes one configuration per element), `{warmup}`, `{iters}`, `{worktree}`, `{pyenv}`, `{repo}`, `{harness}`.
+  `run.cmd` runs `warmup + iters` iterations; `run.env` sets environment variables.
+- **Every iteration starts with the L2-flush kernel `roofline_l2_flush_kernel`** (Python: `flush.flush_l2()`,
+  done by `wrapper.py`; C++ artifacts: a patch, e.g. `patches/credit__roofline_hooks.patch`). It flushes L2 and
+  delimits the iterations in the nsys kernel trace. Per iteration the runner sums the durations of the kernels
+  matching `kernels` (regexes, matched against the demangled names nsys/ncu report).
+- Validation: `validate.cmd` (default: `run.cmd` with warmup 0, iters 1) must exit 0, and its output must match
+  every regex in `validate.expect`. `skip: {shape_id: reason}` declares configurations that do not exist; they
+  are recorded as SKIP with the reason.
+- Python artifacts: a wrapper `roofline/harness/workloads/<manifest>.py` built on `roofline/harness/wrapper.py`
+  (`setup` / `step` / `check`; `--variant`, `--warmup`, `--iters`, `--validate`, one `--<key>` per shape key).
+  `step` runs exactly one iteration of the variant (only its kernels plus what the region needs), `check`
+  compares against the reference of `validate`.
+- Everything runs through `roofline/tools/run` (`../../docs/ENVIRONMENT.md`): `--no-gpu` for `--stage build`,
+  `--profile --lock-sm-mhz 1635` for validate / time / ncu.
 
 Checklist before a manifest is "done":
 0. Any new Python or system dependency is added to `roofline/docker/Dockerfile` (+ its lock file), the

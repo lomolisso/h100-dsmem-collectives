@@ -1,0 +1,294 @@
+diff --git a/src/roofline_hooks.cuh b/src/roofline_hooks.cuh
+new file mode 100644
+index 0000000..a0881bf
+--- /dev/null
++++ b/src/roofline_hooks.cuh
+@@ -0,0 +1,48 @@
++// Roofline-study hooks (h100-dsmem-collectives roofline/patches/credit__roofline_hooks.patch).
++// Controlled by environment variables; with none set the binary behaves exactly as upstream.
++//   ROOFLINE_FLUSH_L2_MB=N          before every launch in time_kernel, run roofline_l2_flush_kernel: a read of
++//                                   a clean N-MB buffer, so the timed kernel finds neither useful nor dirty lines
++//                                   in L2 (the upstream loop launches back to back with a warm L2).
++//   ROOFLINE_BLOCK_VARIANT=read|smem  benchmark and verify only that one-CTA-per-row kernel (upstream runs both
++//                                   and keeps the faster one).
++#pragma once
++#include <cstdlib>
++#include <cstring>
++#include <cuda_runtime.h>
++
++namespace roofline_hooks {
++
++__global__ void roofline_l2_flush_kernel(const int4* __restrict__ buf, size_t n, int* sink) {
++    int acc = 0;
++    for (size_t i = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x; i < n;
++         i += static_cast<size_t>(gridDim.x) * blockDim.x) {
++        const int4 v = __ldcg(buf + i);
++        acc ^= v.x ^ v.y ^ v.z ^ v.w;
++    }
++    if (acc == 0x5eed1e55) *sink = acc;  // never true for the zeroed buffer; keeps the loads alive
++}
++
++inline void flush_l2() {
++    static const size_t mb = [] {
++        const char* v = std::getenv("ROOFLINE_FLUSH_L2_MB");
++        return v ? static_cast<size_t>(std::strtoull(v, nullptr, 10)) : size_t{0};
++    }();
++    if (mb == 0) return;
++    static int4* buf = nullptr;
++    static int* sink = nullptr;
++    const size_t n = mb * (1u << 20) / sizeof(int4);
++    if (buf == nullptr) {
++        if (cudaMalloc(&buf, n * sizeof(int4)) != cudaSuccess || cudaMalloc(&sink, sizeof(int)) != cudaSuccess ||
++            cudaMemset(buf, 0, n * sizeof(int4)) != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess) {
++            std::abort();
++        }
++    }
++    roofline_l2_flush_kernel<<<4 * 132, 1024>>>(buf, n, sink);
++}
++
++inline bool block_enabled(const char* name) {
++    const char* v = std::getenv("ROOFLINE_BLOCK_VARIANT");
++    return v == nullptr || *v == '\0' || std::strcmp(v, name) == 0;
++}
++
++}  // namespace roofline_hooks
+diff --git a/src/workloads/lars_momentum.cu b/src/workloads/lars_momentum.cu
+index 33ff63d..57f4901 100644
+--- a/src/workloads/lars_momentum.cu
++++ b/src/workloads/lars_momentum.cu
+@@ -14,6 +14,7 @@
+ #include <stdexcept>
+ #include <string>
+ #include <vector>
++#include "../roofline_hooks.cuh"
+ 
+ namespace cg = cooperative_groups;
+ 
+@@ -154,6 +155,7 @@ double throughput_gbps(int rows, int cols, double avg_ms) {
+ template <typename LaunchFn>
+ double time_kernel(LaunchFn&& launch, int warmup, int iters) {
+     for (int i = 0; i < warmup; ++i) {
++        roofline_hooks::flush_l2();
+         launch();
+     }
+     CUDA_CHECK(cudaGetLastError());
+@@ -165,6 +167,7 @@ double time_kernel(LaunchFn&& launch, int warmup, int iters) {
+     CUDA_CHECK(cudaEventCreate(&stop));
+     CUDA_CHECK(cudaEventRecord(start));
+     for (int i = 0; i < iters; ++i) {
++        roofline_hooks::flush_l2();
+         launch();
+     }
+     CUDA_CHECK(cudaEventRecord(stop));
+@@ -518,10 +521,12 @@ VariantResult benchmark_best_block(const Options& options,
+                                    int rows,
+                                    int cols) {
+     VariantResult best;
++    if (roofline_hooks::block_enabled("read"))
+     best = pick_better(best,
+                        benchmark_block_read(options, d_weight, d_grad,
+                                             d_momentum, d_weight_out,
+                                             d_momentum_out, rows, cols));
++    if (roofline_hooks::block_enabled("smem"))
+     best = pick_better(best,
+                        benchmark_block_staged(options, device, d_weight, d_grad,
+                                               d_momentum, d_weight_out,
+diff --git a/src/workloads/layernorm_backward.cu b/src/workloads/layernorm_backward.cu
+index e522dd0..ad008ba 100644
+--- a/src/workloads/layernorm_backward.cu
++++ b/src/workloads/layernorm_backward.cu
+@@ -14,6 +14,7 @@
+ #include <stdexcept>
+ #include <string>
+ #include <vector>
++#include "../roofline_hooks.cuh"
+ 
+ namespace cg = cooperative_groups;
+ 
+@@ -150,6 +151,7 @@ double throughput_gbps(int rows, int cols, double avg_ms) {
+ template <typename LaunchFn>
+ double time_kernel(LaunchFn&& launch, int warmup, int iters) {
+     for (int i = 0; i < warmup; ++i) {
++        roofline_hooks::flush_l2();
+         launch();
+     }
+     CUDA_CHECK(cudaGetLastError());
+@@ -161,6 +163,7 @@ double time_kernel(LaunchFn&& launch, int warmup, int iters) {
+     CUDA_CHECK(cudaEventCreate(&stop));
+     CUDA_CHECK(cudaEventRecord(start));
+     for (int i = 0; i < iters; ++i) {
++        roofline_hooks::flush_l2();
+         launch();
+     }
+     CUDA_CHECK(cudaEventRecord(stop));
+@@ -534,9 +537,11 @@ VariantResult benchmark_best_block(const Options& options,
+                                    int rows,
+                                    int cols) {
+     VariantResult best;
++    if (roofline_hooks::block_enabled("read"))
+     best = pick_better(best,
+                        benchmark_block_read(options, d_x, d_dy, d_gamma, d_dx,
+                                             rows, cols));
++    if (roofline_hooks::block_enabled("smem"))
+     best = pick_better(best,
+                        benchmark_block_staged(options, device, d_x, d_dy,
+                                               d_gamma, d_dx, rows, cols));
+diff --git a/src/workloads/pearson_backward.cu b/src/workloads/pearson_backward.cu
+index 6c64f36..602272d 100644
+--- a/src/workloads/pearson_backward.cu
++++ b/src/workloads/pearson_backward.cu
+@@ -14,6 +14,7 @@
+ #include <stdexcept>
+ #include <string>
+ #include <vector>
++#include "../roofline_hooks.cuh"
+ 
+ namespace cg = cooperative_groups;
+ 
+@@ -153,6 +154,7 @@ double throughput_gbps(int rows, int cols, double avg_ms) {
+ template <typename LaunchFn>
+ double time_kernel(LaunchFn&& launch, int warmup, int iters) {
+     for (int i = 0; i < warmup; ++i) {
++        roofline_hooks::flush_l2();
+         launch();
+     }
+     CUDA_CHECK(cudaGetLastError());
+@@ -164,6 +166,7 @@ double time_kernel(LaunchFn&& launch, int warmup, int iters) {
+     CUDA_CHECK(cudaEventCreate(&stop));
+     CUDA_CHECK(cudaEventRecord(start));
+     for (int i = 0; i < iters; ++i) {
++        roofline_hooks::flush_l2();
+         launch();
+     }
+     CUDA_CHECK(cudaEventRecord(stop));
+@@ -583,9 +586,11 @@ VariantResult benchmark_best_block(const Options& options,
+                                    int rows,
+                                    int cols) {
+     VariantResult best;
++    if (roofline_hooks::block_enabled("read"))
+     best = pick_better(best,
+                        benchmark_block_read(options, d_x, d_y, d_grad, d_dx,
+                                             d_dy, rows, cols));
++    if (roofline_hooks::block_enabled("smem"))
+     best = pick_better(best,
+                        benchmark_block_staged(options, device, d_x, d_y,
+                                               d_grad, d_dx, d_dy, rows, cols));
+diff --git a/src/workloads/rowwise_quant.cu b/src/workloads/rowwise_quant.cu
+index 9e5aee5..e00f011 100644
+--- a/src/workloads/rowwise_quant.cu
++++ b/src/workloads/rowwise_quant.cu
+@@ -14,6 +14,7 @@
+ #include <stdexcept>
+ #include <string>
+ #include <vector>
++#include "../roofline_hooks.cuh"
+ 
+ namespace cg = cooperative_groups;
+ 
+@@ -147,6 +148,7 @@ double throughput_gbps(int rows, int cols, double avg_ms) {
+ template <typename LaunchFn>
+ double time_kernel(LaunchFn&& launch, int warmup, int iters) {
+     for (int i = 0; i < warmup; ++i) {
++        roofline_hooks::flush_l2();
+         launch();
+     }
+     CUDA_CHECK(cudaGetLastError());
+@@ -158,6 +160,7 @@ double time_kernel(LaunchFn&& launch, int warmup, int iters) {
+     CUDA_CHECK(cudaEventCreate(&stop));
+     CUDA_CHECK(cudaEventRecord(start));
+     for (int i = 0; i < iters; ++i) {
++        roofline_hooks::flush_l2();
+         launch();
+     }
+     CUDA_CHECK(cudaEventRecord(stop));
+@@ -457,8 +460,10 @@ VariantResult benchmark_best_block(const Options& options,
+                                    int rows,
+                                    int cols) {
+     VariantResult best;
++    if (roofline_hooks::block_enabled("read"))
+     best = pick_better(best, benchmark_block_read(options, d_input, d_output,
+                                                   d_scales, rows, cols));
++    if (roofline_hooks::block_enabled("smem"))
+     best = pick_better(best, benchmark_block_staged(options, device, d_input,
+                                                     d_output, d_scales, rows,
+                                                     cols));
+diff --git a/src/workloads/softmax_logits_backward.cu b/src/workloads/softmax_logits_backward.cu
+index 8c9d317..a21f946 100644
+--- a/src/workloads/softmax_logits_backward.cu
++++ b/src/workloads/softmax_logits_backward.cu
+@@ -15,6 +15,7 @@
+ #include <stdexcept>
+ #include <string>
+ #include <vector>
++#include "../roofline_hooks.cuh"
+ 
+ namespace cg = cooperative_groups;
+ 
+@@ -145,6 +146,7 @@ double throughput_gbps(int rows, int cols, double avg_ms) {
+ template <typename LaunchFn>
+ double time_kernel(LaunchFn&& launch, int warmup, int iters) {
+     for (int i = 0; i < warmup; ++i) {
++        roofline_hooks::flush_l2();
+         launch();
+     }
+     CUDA_CHECK(cudaGetLastError());
+@@ -156,6 +158,7 @@ double time_kernel(LaunchFn&& launch, int warmup, int iters) {
+     CUDA_CHECK(cudaEventCreate(&stop));
+     CUDA_CHECK(cudaEventRecord(start));
+     for (int i = 0; i < iters; ++i) {
++        roofline_hooks::flush_l2();
+         launch();
+     }
+     CUDA_CHECK(cudaEventRecord(stop));
+@@ -570,9 +573,11 @@ VariantResult benchmark_best_block(const Options& options,
+                                    int rows,
+                                    int cols) {
+     VariantResult best;
++    if (roofline_hooks::block_enabled("read"))
+     best = pick_better(best,
+                        benchmark_block_read(options, d_logits, d_dy, d_dx,
+                                             rows, cols));
++    if (roofline_hooks::block_enabled("smem"))
+     best = pick_better(best,
+                        benchmark_block_staged(options, device, d_logits,
+                                               d_dy, d_dx, rows, cols));
+diff --git a/src/workloads/weighted_var_backward.cu b/src/workloads/weighted_var_backward.cu
+index da1b5ac..fe5075a 100644
+--- a/src/workloads/weighted_var_backward.cu
++++ b/src/workloads/weighted_var_backward.cu
+@@ -14,6 +14,7 @@
+ #include <stdexcept>
+ #include <string>
+ #include <vector>
++#include "../roofline_hooks.cuh"
+ 
+ namespace cg = cooperative_groups;
+ 
+@@ -150,6 +151,7 @@ double throughput_gbps(int rows, int cols, double avg_ms) {
+ template <typename LaunchFn>
+ double time_kernel(LaunchFn&& launch, int warmup, int iters) {
+     for (int i = 0; i < warmup; ++i) {
++        roofline_hooks::flush_l2();
+         launch();
+     }
+     CUDA_CHECK(cudaGetLastError());
+@@ -161,6 +163,7 @@ double time_kernel(LaunchFn&& launch, int warmup, int iters) {
+     CUDA_CHECK(cudaEventCreate(&stop));
+     CUDA_CHECK(cudaEventRecord(start));
+     for (int i = 0; i < iters; ++i) {
++        roofline_hooks::flush_l2();
+         launch();
+     }
+     CUDA_CHECK(cudaEventRecord(stop));
+@@ -604,9 +607,11 @@ VariantResult benchmark_best_block(const Options& options,
+                                    int rows,
+                                    int cols) {
+     VariantResult best;
++    if (roofline_hooks::block_enabled("read"))
+     best = pick_better(best,
+                        benchmark_block_read(options, d_input, d_weights, d_dy,
+                                             d_output, rows, cols));
++    if (roofline_hooks::block_enabled("smem"))
+     best = pick_better(best,
+                        benchmark_block_staged(options, device, d_input,
+                                               d_weights, d_dy, d_output, rows,

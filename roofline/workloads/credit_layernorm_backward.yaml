@@ -9,35 +9,53 @@ scope_operator:
     n4k:  {rows: 2048, cols: 4096}
     n16k: {rows: 2048, cols: 16384}
     n64k: {rows: 2048, cols: 65536}
-  flops: "rows*cols*12"
-  min_hbm_bytes: "rows*cols*4*8"
-  validate: {reference: "host double-precision reference inside the binary (omit --no-verify)", tolerance: "binary's own check"}
+  flops: "rows*cols*16"
+  min_hbm_bytes: "rows*cols*12 + cols*4"
+  validate: {reference: "host double-precision reference inside the binary on sampled rows/columns (verification on; the run exits non-zero on a mismatch)", tolerance: "binary's own per-workload check (verify_* in the .cu)"}
   variants:
     - id: block_read
       role: non_dsmem
       description: block_bwd_read_kernel - one CTA per row, re-reads the row from global memory per reduction pass
-      build: {cwd: third_party/CREDIT, cmd: "make all CUDA_ARCH=sm_90a"}
-      run:   {cwd: third_party/CREDIT, cmd: "./build/layernorm_backward --csv --rows {rows} --n-values {cols} --warmup 20 --iters 100 --profile-variant block"}
+      build: {cwd: third_party/CREDIT, patch: patches/credit__roofline_hooks.patch, cmd: "make all CUDA_ARCH=sm_90a -j8"}
+      run:
+        cmd: "./build/layernorm_backward --csv --rows {rows} --n-values {cols} --warmup {warmup} --iters {iters} --profile-variant block"
+        env: {ROOFLINE_FLUSH_L2_MB: "256", ROOFLINE_BLOCK_VARIANT: read}
+      validate:
+        expect: ["^RESULT,{cols},{rows},block_read,"]
       kernels: ["block_bwd_read_kernel"]
       cluster_size: 1
     - id: block_smem
       role: control
-      description: block_bwd_staged_kernel - one CTA stages the whole row in smem (only when it fits; binary reports whichever block variant is faster, so read block_name)
-      build: {cwd: third_party/CREDIT, cmd: "make all CUDA_ARCH=sm_90a"}
-      run:   {cwd: third_party/CREDIT, cmd: "./build/layernorm_backward --csv --rows {rows} --n-values {cols} --warmup 20 --iters 100 --profile-variant block"}
+      description: block_bwd_staged_kernel - one CTA stages the whole row in smem
+      build: {cwd: third_party/CREDIT, patch: patches/credit__roofline_hooks.patch, cmd: "make all CUDA_ARCH=sm_90a -j8"}
+      run:
+        cmd: "./build/layernorm_backward --csv --rows {rows} --n-values {cols} --warmup {warmup} --iters {iters} --profile-variant block"
+        env: {ROOFLINE_FLUSH_L2_MB: "256", ROOFLINE_BLOCK_VARIANT: smem}
+      validate:
+        expect: ["^RESULT,{cols},{rows},block_smem,"]
+      skip: {n64k: "the staged row needs cols*4*1 = 262144 B of shared memory > 232448 B (227 KiB) per CTA; the binary declares the variant invalid"}
       kernels: ["block_bwd_staged_kernel"]
       cluster_size: 1
     - id: cluster_smem
       role: dsmem
       description: cluster_bwd_staged_kernel - P CTAs per row, replicated-push DSMEM AllReduce of the row statistics (best P of 2/4/8 per shape)
-      build: {cwd: third_party/CREDIT, cmd: "make all CUDA_ARCH=sm_90a"}
-      run:   {cwd: third_party/CREDIT, cmd: "./build/layernorm_backward --csv --rows {rows} --n-values {cols} --warmup 20 --iters 100 --cluster-size {P} --profile-variant cluster"}
+      build: {cwd: third_party/CREDIT, patch: patches/credit__roofline_hooks.patch, cmd: "make all CUDA_ARCH=sm_90a -j8"}
+      run:
+        cmd: "./build/layernorm_backward --csv --rows {rows} --n-values {cols} --warmup {warmup} --iters {iters} --cluster-size {P} --profile-variant cluster"
+        env: {ROOFLINE_FLUSH_L2_MB: "256"}
+      validate:
+        expect: ["^META,chosen_cluster_size,{P}$", "^RESULT,{cols},{rows},n/a,.*,cluster_smem,"]
       kernels: ["cluster_bwd_staged_kernel"]
       cluster_size: [2, 4, 8]
 scope_layer: null
 measure: {reps: 100, warmup: 20, flush_l2: true}
 notes: >
-  The binary's timing loop does not flush L2 (back-to-back launches between two events): take ncu
-  counters with --cache-control all and add a 256 MB flush in a wrapper for timed runs, or state warm-L2.
-  Modeled bytes per element in the binary are the compulsory traffic (min_hbm_bytes above).
-  Triton / torch.compile points are optional extras via scripts/run_local.py.
+  Built with patches/credit__roofline_hooks.patch (env-controlled, kernels untouched): ROOFLINE_FLUSH_L2_MB=256 runs
+  roofline_l2_flush_kernel (a read of a clean 256 MB buffer) before every warm-up and timed launch, which also
+  delimits the iterations in the nsys trace; ROOFLINE_BLOCK_VARIANT selects one of the two one-CTA-per-row kernels
+  (upstream benchmarks both and keeps the faster). The binary's own ms / GB/s include the flush and are not used.
+  flops = FP32 operations per element as coded (FFMA = 2; identical in the three kernels; MUFU, FMNMX and
+  conversions not counted); per-row work replicated by every thread (precise divisions, shuffle reductions) adds
+  O(P/cols) per element and explains ncu counts above the formula at small cols. min_hbm_bytes = every array once;
+  the binary's modeled_bytes() counts the block_read kernel's re-read passes, not the compulsory traffic. The DSMEM
+  marker is the best P per shape; the other P are kept as rows. Triton / torch.compile points (scripts/run_local.py) not measured.

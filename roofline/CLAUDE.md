@@ -119,4 +119,9 @@ per task. This section replaces steps 2–3 of `../CLAUDE.md` "Starting a new co
 
 ## Change log  *(append entries here)*
 
-- _none yet_
+- 2026-10-26 (R2) CREDIT, all six workloads: `patches/credit__roofline_hooks.patch` adds environment-controlled hooks
+  (no effect when unset; kernels unchanged): `ROOFLINE_FLUSH_L2_MB` runs a clean-read L2 flush kernel before every
+  launch of the timing loop (upstream launches back to back with a warm L2) and delimits iterations for nsys;
+  `ROOFLINE_BLOCK_VARIANT=read|smem` benchmarks and verifies one one-CTA kernel (upstream keeps only the faster).
+  Manifests: `flops` = FP32 operations per element as coded and `min_hbm_bytes` = compulsory traffic (both were
+  wrong: the old bytes were CREDIT's `modeled_bytes()`, the read kernel's re-read traffic).

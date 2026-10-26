@@ -79,6 +79,8 @@ L ∈ {HBM, L2, L1/SMEM, DSMEM}.
 - `role: control` (optional) — fused but without DSMEM (e.g. ClusterFusion rebuilt with
   `CLUSTER_SIZE 1`): separates the kernel-fusion effect from the DSMEM effect. Arrows go
   non_dsmem → control → dsmem.
+- `role: reference` (optional) — an extra library marker (cuBLAS, cuBLASLt) on the same inputs; drawn, but not part of
+  the arrow chain (it is neither the replaced sequence nor a fusion control). Added in R3.
 - `source: reported` — for `runnable: false` manifests, coordinates taken from the paper.
 
 ## 3. Measurement protocol
@@ -153,4 +155,6 @@ workload,variant_id,role,scope,shape_id,rep,time_ns,wall_ns,flops,int_ops,hbm_by
   SM90 cuBLAS kernels); time `gpu__time_duration.sum`. Not listed (dropped): `launch__grid_size`, `launch__cluster_dim_x`,
   `launch__block_size` as metrics. Write traffic still dirty in L2 at kernel end is missing from `dram__bytes_write`
   (−1.4 % on the 2 GiB write ceiling, more for outputs that fit L2).
-- Build commands actually used per artifact: _TODO (R2–R7, one line per artifact)_
+- Build commands actually used per artifact (the manifests' `build.cmd`, run by `run_manifest.py --stage build` in the
+  per-(submodule, patch) worktree): CREDIT `make all CUDA_ARCH=sm_90a -j8` (+ `patches/credit__roofline_hooks.patch`, R2);
+  _others: R3–R7_
