@@ -11,8 +11,10 @@ ncu rules: `../../docs/ENVIRONMENT.md`.
   tag: see `CLAUDE.md` → *Tooling* (C1).
 - Clock state: SM clock locked by `tools/run --profile --lock-sm-mhz <LOCK>` (GPU 3; value from
   h100-microbench `docs/context/10` §2), memory clock 2619 MHz never changed; the harness logs clocks and
-  throttle reasons per configuration (`results/collectives__clock_log.csv`). Value used: _TODO (C5)_
-- Exact commands used for the sweep and for `ncu`: _TODO (C5)_
+  throttle reasons per configuration (`results/collectives__clock_log.csv`). Value used: **1635 MHz** (GPU 3,
+  C5: 0 of 246 000 timed launches clock-flagged)
+- Exact commands used for the sweep and for `ncu`: `CLAUDE.md` → *Tooling* (C5 entries: `driver.py run --set perf
+  --mode perf … --extra "--tag s<k>"`, `harness/ncu_sweep.py`).
 - DSMEM metric names — **final list (C1, 2026-10-25, `ncu --query-metrics` on GPU 3, ncu 2025.2.1; script
   `harness/ncu_discovery.sh`, raw output `results/ncu_query_metrics.txt` and `results/ncu_discovery__*.csv`, local)**.
   All are listed and were collected with `--clock-control none --cache-control all --csv --page raw --print-units base`:
@@ -115,8 +117,13 @@ file,op,alg,N,M,elem_bytes,payload_bytes,rep,rank,smid,stamp,t_ns
 
 `results/ncu.csv`: `file,op,alg,N,M,elem_bytes,metric,unit,value` (one row per metric, averaged over the 5 replays).
 
-`results/model.csv`: `file,op,alg,N,M,elem_bytes,rank,bytes_sent,bytes_recv,rounds` — the docstring/README
-traffic model evaluated by a small script, so the notebook can plot measured vs model.
+`results/model.csv`: `file,op,alg,N,M,elem_bytes,rank,bytes_sent,bytes_recv,bytes_initiated,bytes_self,rounds,global_read_bytes,global_write_bytes`
+— the per-rank traffic model of `harness/traffic_model.py` (C5), so the notebook can plot measured vs model.
+`bytes_sent` = DSMEM payload leaving rank r's SM (its pushes + what peers pull from it), `bytes_recv` = payload
+arriving (peers' pushes + its pulls), `bytes_initiated` = payload moved by r's own instructions; each
+inter-CTA byte appears once in Σ sent = Σ recv = Σ initiated = the kernel-wide ncu DSMEM bytes (C1).
+`bytes_self` = accesses to its own smem through a cluster address (not inter-CTA; not counted by ncu for the
+credit self-stores). `global_*` = the rank's global-memory payload (`in` read; `out`, stamps, `smid` written).
 
 ## 6. Figures (produced by `analysis/dsmem_collectives.ipynb`)
 

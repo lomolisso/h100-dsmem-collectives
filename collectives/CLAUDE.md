@@ -62,6 +62,14 @@ Follow `../CLAUDE.md` ("Starting a new conversation"): the task is the first row
     and, from the repo root, `nvcc -arch=sm_90a -O3 -lineinfo -std=c++17 -I common/h100mb -o collectives/build/harness_selftest <MB>/experiments/01__timers_and_harness/src/harness_selftest.cu -L/usr/local/cuda/lib64/stubs -lcuda -lnvidia-ml`).
   - GPU smoke: `$TR --profile --lock-sm-mhz 1635 -- python3 collectives/harness/driver.py run --smoke --mode correctness --pattern A --reps 5 --processes 1 --child-timeout 120`.
   - ncu discovery: `$TR --profile --lock-sm-mhz 1635 -- bash collectives/harness/ncu_discovery.sh`.
+  - C5 perf set (payload points 256 B…64 KiB per CTA + largest M per (file, N), float):
+    `$TR --no-gpu -- python3 collectives/harness/driver.py build --set perf --jobs 16`; correctness of the new
+    configurations `$TR --profile --lock-sm-mhz 1635 -- python3 collectives/harness/driver.py run --set default --ops reducescatter alltoall --T float --mode correctness --pattern A --reps 200 --processes 3`.
+  - C5 sweeps: `$TR --profile --lock-sm-mhz 1635 -- python3 collectives/harness/driver.py run --set perf --mode perf --reps 200 --processes 1 --shuffle --seed <k> --extra "--tag s<k>"` (k = 1, 2).
+  - C5 ncu pass: `$TR --profile --lock-sm-mhz 1635 -- python3 collectives/harness/ncu_sweep.py` (per configuration:
+    `ncu --clock-control none --cache-control all --kernel-name collective_kernel --launch-skip 20 --launch-count 5 --section MemoryWorkloadAnalysis_Tables --metrics <list in ncu_sweep.py> --csv --page raw --print-units base build/<cfg> --mode ncu --reps 25`, plus `--baseline` / `baseline_kernel` runs).
+  - C5 model and summary (no GPU): `python3 collectives/harness/traffic_model.py --set perf`;
+    `python3 collectives/harness/perf_report.py`.
 
 ## File contract (what the harness may rely on)
 
@@ -142,3 +150,10 @@ Follow `../CLAUDE.md` ("Starting a new conversation"): the task is the first row
   before the first cluster barrier, as before). Unchanged: shift schedule, rounds (N-2, 1 for N = 2), one remote
   `atomicAdd` per element per round, 2 cluster barriers per round. The `M <= 1024` assert is gone (shared memory
   2M; M_max now 29 056 at N = 2/4). README row: also corrected the total for N = 2 (M·B, not 0).
+- 2026-10-25 (C5, documentation only; found while writing `harness/traffic_model.py`, verified against the code):
+  `allgather__gather_bcast_binomial__mpich` docstring and README total were wrong — the gather sends each
+  non-root rank's whole subtree (lowbit(b) slots), so it moves (N/2)·log2 N blocks, not N−1 (e.g. N = 4: 4
+  blocks): total (N/2)·log2 N·M·B + (N−1)·N·M·B. README `allreduce__pull_reduce_scatter_push_allgather__hpcops`
+  rounds: 1 (pull, reduce and push fused in one loop, one `st.round`), not "2 phases, 1 round each";
+  `allreduce__rabenseifner__mpich` N constraint also needs N | M and 16-byte chunks. README note added on
+  self-addressed cluster accesses (`bytes_self`). No code changed.

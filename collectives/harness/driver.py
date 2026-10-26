@@ -53,6 +53,7 @@ import io
 import os
 import random
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -63,6 +64,7 @@ COLL = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # collective
 OPS = {"allreduce": 0, "allgather": 1, "reducescatter": 2, "alltoall": 3}
 SUM_OPS = {"allreduce", "reducescatter"}
 NS, MS = [2, 4, 8, 16], [16, 64, 256, 1024, 4096, 16384]
+PAYLOADS = [256, 1024, 4096, 16384, 65536]  # bytes per CTA, EXPERIMENTS §3 (perf sweep)
 SMEM_LIMIT = 232448  # bytes per block, H100 opt-in maximum (227 KiB); main.cu static_asserts the same value
 MANDATORY = ["gpu_name", "sm_count", "sm_clock_mhz", "mem_clock_mhz", "cuda_version", "driver_version", "run_id",
              "launch_idx"]
@@ -151,6 +153,46 @@ def grid(args):
             if selected(args, f, n, t) and (not args.M or m in args.M)]
 
 
+def payload_m(f, n, p):
+    """MSG_ELEMS for a payload of p bytes per CTA (float): allreduce/allgather M*B, reducescatter/alltoall N*M*B."""
+    return p // 4 if split(f)[0] in ("allreduce", "allgather") else p // (4 * n)
+
+
+def payload_points(args, lb):
+    """(file, N, M, 'float') for every PAYLOADS point of every (file, N) that has an OK float build (legal N)."""
+    pts = set()
+    for f in files():
+        for n in NS:
+            if not selected(args, f, n, "float"):
+                continue
+            if not any(r["status"] == "OK" for (ff, nn, m, t), r in lb.items() if (ff, nn, t) == (f, n, "float")):
+                continue
+            for p in PAYLOADS:
+                if payload_m(f, n, p) >= 1:
+                    pts.add((f, n, payload_m(f, n, p), "float"))
+    return sorted(pts)
+
+
+def runnable(lb, args, which="default"):
+    """Configurations a run uses. default: OK grid builds + the largest OK M_max point per (file, N, T) + OK payload
+    points (C2/C3 correctness set, extended by C5's payload points). perf: per (file, N), float, the OK payload
+    points plus the largest OK M (C5 sweep set)."""
+    ok = {c: r for c, r in lb.items() if r["status"] == "OK" and selected(args, c[0], c[1], c[3])
+          and (not args.M or c[2] in args.M)}
+    if which == "perf":
+        pts = set(payload_points(args, lb))
+        top = {}
+        for (f, n, m, t) in ok:
+            if t == "float" and m > top.get((f, n), 0):
+                top[(f, n)] = m
+        return sorted(c for c in ok if c[3] == "float" and (c in pts or top[(c[0], c[1])] == c[2]))
+    best = {}
+    for (f, n, m, t), r in ok.items():  # of the M_max points keep only the largest OK one per (file, N, T)
+        if r["grid"] == "0" and m > best.get((f, n, t), 0):
+            best[(f, n, t)] = m
+    return sorted(c for c, r in ok.items() if c[2] in MS or r["grid"] == "2" or best.get((c[0], c[1], c[3])) == c[2])
+
+
 def nvcc_release():
     try:
         v = subprocess.run(["nvcc", "--version"], capture_output=True, text=True).stdout
@@ -230,10 +272,13 @@ class Builder:
         return (not self.args.force and (f, n, m, t) in self.have and os.path.exists(log)
                 and os.path.getmtime(log) > max(self.common, os.path.getmtime(f"{f}.cu")))
 
-    def run(self, cfgs, is_grid):
-        """Build cfgs in parallel, append their rows; returns {cfg tuple: status}."""
+    def run(self, cfgs, kind):
+        """Build cfgs in parallel, append their rows (grid column = kind: 1 grid, 0 M_max, 2 payload point)."""
+        kinds = kind if isinstance(kind, dict) else {c: kind for c in cfgs}
         todo = [c for c in cfgs if not self.fresh(*c)]
-        print(f"build ({'grid' if is_grid else 'M_max'}): {len(todo)} to compile, {len(cfgs) - len(todo)} up to date, "
+        label = {1: 'grid', 0: 'M_max', 2: 'payload points'}.get(kind, 'mixed') if not isinstance(kind, dict) else 'set'
+        print(f"build ({label}): {len(todo)} to compile, "
+              f"{len(cfgs) - len(todo)} up to date, "
               f"{self.args.jobs} jobs", flush=True)
         out, t0 = {}, time.time()
         with cf.ThreadPoolExecutor(max_workers=self.args.jobs) as ex:
@@ -243,7 +288,7 @@ class Builder:
                 status, smem, static, regs, spill, msg = fu.result()
                 op, alg = split(f)
                 append_rows(MATRIX, BUILD_HDR, [["", "", "", "", self.rel, "", self.reg.run_id, -1, f, op, alg, n, m,
-                                                 t, int(is_grid), status, smem, static, regs, spill, msg]])
+                                                 t, int(kinds[(f, n, m, t)]), status, smem, static, regs, spill, msg]])
                 self.have.add((f, n, m, t))
                 out[(f, n, m, t)] = status
                 self.counts[status] = self.counts.get(status, 0) + 1
@@ -276,7 +321,18 @@ def cmd_build(args):
     os.makedirs("build/logs", exist_ok=True)
     reg = Registry(sys.argv)
     b = Builder(args, reg)
-    b.run(grid(args), True)
+    if args.set == "perf":  # the C5 sweep set: payload points (new: grid = 2) + the largest OK M per (file, N)
+        lb = latest_build_including(reg.run_id)
+        kinds = {c: 2 for c in payload_points(args, lb) if c not in lb or lb[c]["grid"] == "2"}
+        kinds.update({c: int(lb[c]["grid"]) for c in payload_points(args, lb) if c in lb and lb[c]["grid"] != "2"})
+        b.run(sorted(kinds), kinds)
+        lb = latest_build_including(reg.run_id)
+        top = {c: int(lb[c]["grid"]) for c in runnable(lb, args, "perf") if c not in kinds}
+        b.run(sorted(top), top)
+        reg.complete()
+        print("build done:", b.counts)
+        return
+    b.run(grid(args), 1)
     if not args.no_mmax:
         # Per (file, N, T): granularity 4 elements (16 B) first; on a divisibility static_assert retry with 4*N, then
         # 16*N; on SKIP:smem (padding) step down by the granularity, at most 3 times.
@@ -290,7 +346,7 @@ def cmd_build(args):
                     cands[key] = m
             if not cands:
                 break
-            res = b.run([(f, n, m, t) for (f, n, t), m in cands.items()], False)
+            res = b.run([(f, n, m, t) for (f, n, t), m in cands.items()], 0)
             lb = latest_build_including(reg.run_id)
             nxt = {}
             for (f, n, t), m in cands.items():
@@ -328,12 +384,7 @@ def gpu_idle(timeout_s=120):
 
 def cmd_run(args):
     lb = latest_build()
-    ok = {c: r for c, r in lb.items() if r["status"] == "OK"}
-    best = {}
-    for (f, n, m, t), r in ok.items():  # of the M_max points keep only the largest OK one per (file, N, T)
-        if m not in MS and m > best.get((f, n, t), 0):
-            best[(f, n, t)] = m
-    ok = {c: r for c, r in ok.items() if c[2] in MS or best[(c[0], c[1], c[3])] == c[2]}
+    ok = {c: lb[c] for c in runnable(lb, args, args.set)}
     sel = []
     if args.smoke:
         for f in files():
@@ -350,7 +401,7 @@ def cmd_run(args):
                 if big not in sel:
                     sel.append(big)
     else:
-        sel = sorted(c for c in ok if selected(args, c[0], c[1], c[3]) and (not args.M or c[2] in args.M))
+        sel = sorted(ok)
     if args.pattern == "B":
         sel = [c for c in sel if c[3] == "float"]  # pattern B is float-only
     if args.shuffle:
@@ -368,7 +419,8 @@ def cmd_run(args):
             continue
         for proc in range(args.processes):
             cmd = [f"build/{cfg}", "--mode", args.mode, "--pattern", args.pattern, "--reps", str(args.reps),
-                   "--process", str(proc)] + (["--timeout-ms", str(args.timeout_ms)] if args.timeout_ms else [])
+                   "--process", str(proc)] + (["--timeout-ms", str(args.timeout_ms)] if args.timeout_ms else []) \
+                  + shlex.split(args.extra)
             line = " ".join(cmd)
             if line in done and not args.rerun:
                 stats["SKIPPED_COMPLETE"] = stats.get("SKIPPED_COMPLETE", 0) + 1
@@ -438,6 +490,8 @@ def main():
         p.add_argument("--N", nargs="*", type=int)
         p.add_argument("--M", nargs="*", type=int)
         p.add_argument("--T", nargs="*")
+        p.add_argument("--set", default="default", choices=["default", "perf"],
+                       help="default: C2/C3 correctness set; perf: C5 sweep set (payload points + largest M)")
         if name == "build":
             p.add_argument("--jobs", type=int, default=16)
             p.add_argument("--force", action="store_true")
@@ -453,6 +507,7 @@ def main():
             p.add_argument("--shuffle", action="store_true")
             p.add_argument("--seed", type=int, default=0)
             p.add_argument("--rerun", action="store_true", help="also run command lines that are already complete")
+            p.add_argument("--extra", default="", help="extra arguments for the binary, e.g. '--tag s1'")
     args = ap.parse_args()
     if args.cmd == "build":
         args.jobs = min(args.jobs, 16)  # the host is shared

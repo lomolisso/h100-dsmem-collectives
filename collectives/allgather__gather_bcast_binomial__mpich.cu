@@ -9,8 +9,9 @@
  *    slots in natural order. Broadcast: d = N/2 .. 1, holders push the full N-slot buffer to b + d.
  *
  * 3. Pattern: binomial tree, 2*log2(N) rounds. Gather messages grow (d*M*sizeof(T)); broadcast
- *    messages are the full N*M*sizeof(T). Cluster-wide traffic (N-1)*M + (N-1)*N*M elements: the
- *    broadcast of the already-gathered buffer makes this the most traffic-hungry all-gather, which is
+ *    messages are the full N*M*sizeof(T). Cluster-wide traffic (N/2)*log2(N)*M + (N-1)*N*M elements
+ *    (gather: every non-root rank b sends its whole subtree, lowbit(b) slots, once; broadcast: N-1 full
+ *    buffers): the broadcast of the already-gathered buffer makes this the most traffic-hungry all-gather, which is
  *    why symmetric algorithms are preferred; included as the rooted baseline.
  *    Primitive: cp.async.bulk push into the parent's/child's buffer at the right slot offset +
  *    mbarrier complete_tx; parity wait; barrier.cluster per round.

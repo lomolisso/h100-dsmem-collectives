@@ -34,15 +34,8 @@ SUMMARY_HDR = driver.MANDATORY + ["file", "op", "alg", "N", "M", "T", "pattern",
 
 
 def expected(args):
-    lb = driver.latest_build()
-    ok = {c: r for c, r in lb.items() if r["status"] == "OK"}
-    best = {}
-    for (f, n, m, t) in ok:
-        if m not in driver.MS:
-            best[(f, n, t)] = max(best.get((f, n, t), 0), m)
     sel = driver.argparse.Namespace(files=None, ops=args.ops, N=None, M=None, T=None)
-    return sorted(c for c in ok if (c[2] in driver.MS or best[(c[0], c[1], c[3])] == c[2])
-                  and driver.selected(sel, c[0], c[1], c[3]))
+    return driver.runnable(driver.latest_build(), sel, "default")
 
 
 def main():

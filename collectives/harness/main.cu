@@ -39,7 +39,8 @@
  *       results/correctness.csv: file,op,alg,N,M,T,pattern,process,rep,status,max_abs_err,max_rel_err,n_bad,
  *       latency_ns,event_ms,smids,smid_distinct,clock_bad,max_active_clusters
  *       (status PASS | FAIL | DEADLOCK; latency_ns = max_r ts[r][exit] - min_r ts[r][entry]).
- *   --mode perf  20 warm-up + R timed launches, only the last output is checked →
+ *   --mode perf  20 warm-up + R timed launches, only the last output is checked; with --tag <s> the files are
+ *       stamps_<op>_<s>.csv, host_<s>.csv, perf_check_<s>.csv (C5: one stamps file per op and sweep) →
  *       results/stamps.csv: file,op,alg,N,M,elem_bytes,payload_bytes,rep,rank,smid,stamp,t_ns,clock_bad
  *       results/host.csv:   file,op,alg,N,M,elem_bytes,rep,event_ms,clock_bad
  *       results/perf_check.csv: file,op,alg,N,M,T,pattern,process,reps,status,max_abs_err,max_rel_err,n_bad,n_clock_bad
@@ -192,6 +193,7 @@ int main(int argc, char** argv) {
     const int threads = (int)hb::arg_int(argc, argv, "--threads", 256);
     const long long timeout_ms = hb::arg_int(argc, argv, "--timeout-ms", is_ncu ? 600000 : 5000);
     const bool baseline = hb::has_flag(argc, argv, "--baseline");
+    const std::string tag = hb::arg_str(argc, argv, "--tag", "");  // perf mode: output file suffix (sweep id)
     if (reps < 1 || threads < 32 || threads > 1024 || threads % 32) hb::die("bad --reps / --threads");
     if (baseline && !is_ncu) hb::die("--baseline is only for --mode ncu");
 
@@ -245,13 +247,14 @@ int main(int argc, char** argv) {
                                                            "event_ms", "smids", "smid_distinct", "clock_bad",
                                                            "max_active_clusters"})));
     if (is_perf) {
-        w_stamps.reset(new hb::CsvWriter(hb::Run::results("stamps.csv"),
+        const std::string sfx = tag.empty() ? "" : "_" + tag;  // C5: one stamps file per op and sweep
+        w_stamps.reset(new hb::CsvWriter(hb::Run::results(tag.empty() ? "stamps.csv" : "stamps_" + op + sfx + ".csv"),
                                          hb::with_mandatory({"file", "op", "alg", "N", "M", "elem_bytes", "payload_bytes",
                                                              "rep", "rank", "smid", "stamp", "t_ns", "clock_bad"})));
-        w_host.reset(new hb::CsvWriter(hb::Run::results("host.csv"),
+        w_host.reset(new hb::CsvWriter(hb::Run::results("host" + sfx + ".csv"),
                                        hb::with_mandatory({"file", "op", "alg", "N", "M", "elem_bytes", "rep", "event_ms",
                                                            "clock_bad"})));
-        w_pcheck.reset(new hb::CsvWriter(hb::Run::results("perf_check.csv"),
+        w_pcheck.reset(new hb::CsvWriter(hb::Run::results("perf_check" + sfx + ".csv"),
                                          hb::with_mandatory({"file", "op", "alg", "N", "M", "T", "pattern", "process",
                                                              "reps", "status", "max_abs_err", "max_rel_err", "n_bad",
                                                              "n_clock_bad"})));
