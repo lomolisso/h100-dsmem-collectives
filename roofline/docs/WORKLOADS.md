@@ -33,8 +33,9 @@ the workload tasks translate them:
 
 ## 1. ClusterFusion — Llama-2-7B fused decoder (`clusterfusion_llama2_7b_decoder`)
 - **Computation** (one token, fp16): RMSNorm → QKV GEMV (4096 → 3·4096) → RoPE → flash-decoding over the
-  KV cache (S × 32 heads × 128) → O-proj (4096 → 4096). FLOPs ≈ 2·4096·12288 + 4·S·32·128 + 2·4096² ;
-  compulsory HBM bytes ≈ 2·(3·4096² + 4096²) + 2·2·S·4096 (weights + K and V cache).
+  KV cache (S cached tokens + the new one, × 32 heads × 128) → O-proj (4096 → 4096). FLOPs ≈ 2·4096·12288 +
+  4·(S+1)·32·128 + 2·4096² (+ softmax, norm, RoPE: < 1 %); compulsory HBM bytes ≈ 2·(3·4096² + 4096²) +
+  2·2·S·4096 (weights + K and V cache); exact formulas in the manifest.
 - **DSMEM variant**: `clusterfusion.llama_decoder_layer_sglang` → `LlamaDecoderLayerKernel`
   (`include/H100/llama/kernel_sglang.cuh`), 32 head-clusters × 4 CTAs. Collectives: scalar AllReduce via
   remote atomics, vector AllReduce via bulk push (`../../kernels/fused_decoder_layer__llama2_7b__clusterfusion.cu`).
@@ -43,29 +44,69 @@ the workload tasks translate them:
     `flashinfer.fused_add_rmsnorm` → `nn.Linear` QKV → torch NEOX RoPE →
     `flashinfer.single_decode_with_kv_cache(use_tensor_cores=False)` → `nn.Linear` O-proj.
   - `fused_c1` (role control): the same fused kernel rebuilt with `#define CLUSTER_SIZE 1` in
-    `include/H100/llama/config.h` (one CTA per head; ~107 KB smem; the reduce loops run zero rounds, which
-    is correct for N = 1). Untested by the authors — validate against `unfused` first.
+    `include/H100/llama/config.h` (one CTA per head; ~105 KB smem; the reduce loops run zero rounds, which
+    is correct for N = 1). Untested by the authors, and wrong as is (found in R4 by reading the code): the
+    RMSNorm prologue of `kernel_sglang.cuh` keeps `x + residual` only in the registers of the last loop
+    iteration, which is correct only when `DIM_PER_BLOCK = 4096 / CLUSTER_SIZE = 1024` (cluster 4);
+    `patches/clusterfusion__cluster_size_1.patch` also stages it in shared memory (and carries the residual fix
+    below). Validate against `unfused`.
   - TileLang port `tilelang_llama.py` accepts `cluster_size=1` but is marked untested; optional.
 - **Layer scope**: add the FFN (gate/up/down GEMVs 4096↔11008 + SiLU), residual adds and the second RMSNorm
   from `chat/llama/model.py`; the FFN is identical in both variants.
 - **Traps**: dispatchers call `cudaDeviceSynchronize` and re-encode TMA maps per call — time with ncu/nsys;
   only cluster sizes 1 and 4 are correct (2 runs zero reduce rounds, ≥ 8 double-counts);
-  `kernel_sglang.cuh` updates `residual` in place from every head cluster (benign for timing, keep
-  validation to the attention output); build `pip install -e .` (CUDA 12.4+, sm_90a).
+  `kernel_sglang.cuh` updates `residual` in place from every head cluster, and this is a **race, confirmed on
+  GPU 3 in R4**: a CTA that reads `residual` after another cluster's write normalises `2·input + residual`, so on
+  each call a few random heads get wrong q/k/v (whole head, k/v rel. L2 ~8 %), at cluster 4 and 1, and repeated
+  calls are not bit-identical. Fix used for both fused variants (residual_out, carried by
+  `patches/clusterfusion__residual_out_c4_fix.patch` and `patches/clusterfusion__cluster_size_1.patch`): the sum
+  goes to a separate `residual_output` (returned in place of `residual`, which is only read), as upstream's own
+  `kernel_batch_sglang.cuh` does. A second race, **confirmed on GPU 3 in R4 at cluster 4 only**: the QKV GEMV and
+  flash-decoding loops refill TMA buffer `id % 2` before warps 1–3 have finished reading tile `id − 2` from it
+  (wrong k/v rows of warps 1–3 in heads 6, 7, 30, 31 in 1–5 of 20 launches; two CTAs share an SM there);
+  fixed with one `block.sync()` per loop iteration in both fused builds (0 of 600 launches deviate). The cluster-4
+  build also carries a `dsm.cuh` `cluster_reduce` hardening (a CTA could overwrite its bulk-push source before the
+  outgoing copy is known to be read; missing proxy/mbarrier-init fences) — required by the PTX memory model, not
+  observed. Validation checks 20 launches against the unfused sequence (until 2026-10-26 the wrapper compared
+  fused variants with an extra launch of themselves), bit-identical k/v/residual across them, and the residual
+  output exactly; upstream
+  `tests/test_llama.py` builds the reference KV with `torch.cat` (a full cache copy per call) — the study's
+  unfused baseline appends into a preallocated cache instead; build: `setup.py` reads the device architecture
+  at import (`harness/workloads/build_clusterfusion.py` stubs it to sm_90 for `--no-gpu` builds).
 
 ## 2. ClusterFusion — DeepSeek-V2-Lite fused MLA decoder (`clusterfusion_deepseek_v2_lite_mla`)
 - **Computation**: `../../kernels/fused_mla_decoder_layer__deepseek_v2_lite__clusterfusion.cu` docstring
   (hidden 2048, 16 heads, kv_lora_rank 512, rope 64, nope 128, compile-time SEQ_LEN 4096).
 - **DSMEM variant**: `clusterfusion.deepseek_decoder_layer` (no Python test exists; nine TMA maps).
-- **Non-DSMEM**: must be written by the agent in torch/flashinfer (down-projections, RMSNorm, W_UK
-  absorption, MQA decode over the latent cache, W_UV, O-proj); plus `CLUSTER_SIZE 1` rebuild as control.
+- **What it computes** (R7, read from `include/H100/deepseek/kernel.cuh`; details with line numbers in the
+  wrapper docstring `../harness/workloads/clusterfusion_deepseek_v2_lite_mla.py`): absorbed MLA decode
+  **without the rope score term and without a KV append**. q_pe and k_pe are projected and rotated but never
+  read by the attention (the cache TMA boxes cover only the 512 latent columns of the 576-wide rows; the score is
+  q_lat · c_kv / √192); the new latent replaces cache row S−1 in registers, the cache is never written. Output:
+  `o` [1, 2048] only (fp16 atomicAdd over the 16 heads; no residual). Every head cluster recomputes c_kv | k_pe.
+  The k_pe RoPE reads a wrong partner (l.305 misses `+ KV_LORA_RANK`; unobservable).
+- **Non-DSMEM**: `unfused` written in R7 (same wrapper): flashinfer rmsnorm → cuBLAS q / kv_a GEMVs →
+  flashinfer rmsnorm(c_kv) + RoPE writing the new token into cache row S−1 → cuBLAS bmm W_UK →
+  `flashinfer.single_decode_with_kv_cache` at head_dim 512, group 16, K = V = latent cache → bmm W_UV → O-proj.
+  flashinfer's MLA wrapper is not used (it always adds q_pe · k_pe). Control `fused_c1`: upstream's
+  `CLUSTER_SIZE 1` build is wrong in three places (RMSNorm prologue registers, the Llama bug pattern; only 128 of
+  the 512 W_UK outputs; only 128 of the 512 W_UV rows) — fixed in `patches/clusterfusion__deepseek_cluster_size_1.patch`.
+  The Llama residual race does not exist here (no residual, inputs only read).
+- **Traps**: compile-time `SEQ_LEN 4096` (one shape); only cluster sizes 1 (patched) and 4 are correct (N−2
+  reduce rounds); shared-memory races of the shipped kernel, not observed here (pin 20/20) but fixed in both fused
+  builds because the same pattern broke the Llama cluster-4 build: TMA double buffers refilled before every warp
+  read the previous tile (one `block.sync()` per loop iteration) and CTA 0's q_lat / W_UV writes into
+  local_qkv[0..128) racing other warps' reads of that range (`block.sync()` before each write); fused_c4 also
+  carries the `dsm.cuh` hardening (spec-required, not observed) — validation checks 20 launches; P·V accumulated in fp16 registers (dominant error: emulated a_lat rel. L2 2.2e-3 at cluster 4,
+  4.8e-3 at cluster 1).
 - Lowest priority of the ClusterFusion entries.
 
 ## 3. ClusterFusion — RMSNorm (`clusterfusion_rmsnorm`)
 - `clusterfusion.rmsnorm` (`norm/kernel.cuh`, cluster 2, batch 64 × hidden 8192, compile-time) vs
   `flashinfer.norm.rmsnorm` (`tests/test_norm.py`). Do **not** use a cluster-1 rebuild: the single
   shift-by-1 remote `atomicAdd` would add into the CTA's own sum. Memory-bound sanity point
-  (FLOPs ≈ 3 per element, bytes ≈ 4 per element).
+  (FLOPs = 4 per element: x² accumulated by one FFMA + two FMUL for `x * rms_rcp * w`, `norm/kernel.cuh`;
+  bytes ≈ 4 per element).
 
 ## 4. CREDIT — six reduction-reuse workloads (`credit_<workload>`)
 - **Computation**: row-wise fp32 kernels (`../../kernels/<workload>__reduction_reuse__credit.cu`
@@ -97,17 +138,25 @@ the workload tasks translate them:
 - **Non-DSMEM**: no flag exists. Either pad the row capacity to 17 rows (`ke.numel() = 17`,
   `num_valid_rows = m`) so the dispatcher picks the row-local single-CTA kernel (n ≤ 131072) or the
   4-way KV-split global-workspace kernel (n > 131072), or apply `patches/hpcops_topk__use_cluster_false.patch`
-  (`use_cluster = false` at line 2868) to get the exact 8-way KV-split analogue.
-- Build: `make sm90` (wheel) — CUDA 12.9+, C++20. Tests only, no benchmark; shapes from
-  `tests/test_topk.py` cluster section: (8, 32768), (16, 65536), (8, 244650).
+  (`use_cluster = false` at line 2868), the library's own dispatch on pre-SM90 GPUs. Measured in R6: with the patch,
+  m = 8/16 and n ≤ 131072 run the same row-local kernel as the padding route (so `pad17` is skipped there), and only
+  n = 244650 runs a split — an 8-way split with a 1/64 sample that predicts the threshold and merges through global
+  memory (a different algorithm from the cluster's two exact scans, not an "exact 8-way analogue"); padding gives the
+  4-way split there (`pad17`, role `reference`).
+- Build (R6): `harness/workloads/build_hpcops.py` = the unmodified `setup.py build_ext --inplace` with `SM_ARCH=90` and
+  `-j$MAX_JOBS` instead of the hard-coded `-j64`; module `hpc/_C_sm90.abi3.so` in the worktree, `HPC_SM_ARCH=90`.
+  Tests only, no benchmark; shapes from `tests/test_topk.py` cluster section: (8, 32768), (16, 65536), (8, 244650).
 
 ## 6. hpc-ops — Lamport RMSNorm (`hpcops_rmsnorm_lamport`)
 - `rmsNormLamport` is the second kernel of a **multi-GPU** fused AllReduce+RMSNorm; its DSMEM part is a
   replicated-push AllReduce of one float across a cluster of 8/4/2 CTAs per token (only for ≤ 33 tokens).
 - Non-DSMEM: same kernel at cluster size 1 (automatic for ≥ 67 tokens, or patch `clusterSize = 8 → 1` at
   `fuse_allreduce_rmsnorm_low_latency.h:474`); or `rmsnorm_fusion=False` + `flashinfer.fused_add_rmsnorm`.
-- `runnable: conditional`: only if `fuse_allreduce_rmsnorm_low_latency` accepts world size 1 on one GPU;
-  otherwise skip and say so.
+- **Not measurable on one GPU (R6, `runnable: false`):** `entry.cc:132` rejects world sizes outside 2–64; the launcher
+  instantiates the two-shot kernel only for 2…64 ranks (`fuse_allreduce_rmsnorm_low_latency.cu:342-363`);
+  `rmsNormLamport` has no input of its own — it spins on the Lamport broadcast buffer written by the multimem
+  broadcast after the scatter from the other ranks (cu:40-41, 64-95, 114, 175-227). Running it on one GPU would need a
+  different launcher (pre-filled buffer and flags), i.e. a different program.
 
 ## 7. DAK — multicast GEMM (`dak_gemm_multicast`)
 - **Computation**: C[tokens, M] = X[tokens, K] · W (fp16, WGMMA 64×256×16), the OPT/Llama linear layers;

@@ -7,24 +7,46 @@ scope_operator:
   description: y = x * rsqrt(mean(x^2) + eps) * w per row
   shapes:
     s0: {rows: 64, hidden: 8192}
+  # per element: x^2 accumulated (1 FFMA = 2) + x * rms_rcp * w (2 FMUL) = 4 (norm/kernel.cuh; flashinfer's kernel
+  # does the same plus an FADD of weight_bias = 0, not counted); per-row rsqrt and tree reductions not counted
   flops: "rows*hidden*4"
+  # read x, write y, read w (fp16)
   min_hbm_bytes: "2*(2*rows*hidden + hidden)"
-  validate: {reference: "flashinfer.norm.rmsnorm (tests/test_norm.py)", tolerance: "max abs 1e-2 fp16"}
+  validate: {reference: "flashinfer.norm.rmsnorm (tests/test_norm.py) for cluster2; fp32 torch for flashinfer", tolerance: "max abs 1e-2 fp16, plus the kernel audit"}
   variants:
     - id: flashinfer
       role: non_dsmem
-      description: flashinfer.norm.rmsnorm, one CTA per row
-      build: {cwd: third_party/ClusterFusion, cmd: "pip install flashinfer-python"}
-      run:   {cwd: third_party/ClusterFusion, cmd: "python tests/test_norm.py # reference part"}
-      kernels: ["RMSNorm|rmsnorm"]
+      description: flashinfer.norm.rmsnorm (CUDA kernel flashinfer::norm::RMSNormKernel), one CTA of 1024 threads per row
+      build: {cwd: third_party/ClusterFusion, cmd: "python3 {harness}/workloads/build_clusterfusion.py", env: {MAX_JOBS: "16"}}
+      run:
+        cmd: "python3 {harness}/workloads/clusterfusion_rmsnorm.py --variant flashinfer --rows {rows} --hidden {hidden} --warmup {warmup} --iters {iters}"
+      validate:
+        cmd: "python3 {harness}/workloads/clusterfusion_rmsnorm.py --variant flashinfer --rows {rows} --hidden {hidden} --validate"
+        expect: ["^CHECK variant=flashinfer .* ok$", "^VALIDATION PASS$"]
+      # each variant's step launches only its own kernel, so the shared name RMSNormKernel is unambiguous
+      kernels: ["RMSNormKernel"]
       cluster_size: null
     - id: cluster2
       role: dsmem
-      description: RMSNormKernel, cluster of 2 CTAs per row, scalar AllReduce via one remote atomicAdd
-      build: {cwd: third_party/ClusterFusion, cmd: "pip install -e ."}
-      run:   {cwd: third_party/ClusterFusion, cmd: "python tests/test_norm.py # clusterfusion.rmsnorm part"}
+      description: RMSNormKernel, cluster of 2 CTAs (512 threads each) per row, scalar AllReduce via one remote atomicAdd
+      build: {cwd: third_party/ClusterFusion, cmd: "python3 {harness}/workloads/build_clusterfusion.py", env: {MAX_JOBS: "16"}}
+      run:
+        cmd: "python3 {harness}/workloads/clusterfusion_rmsnorm.py --variant cluster2 --rows {rows} --hidden {hidden} --warmup {warmup} --iters {iters}"
+        pythonpath: ["{worktree}"]
+      validate:
+        cmd: "python3 {harness}/workloads/clusterfusion_rmsnorm.py --variant cluster2 --rows {rows} --hidden {hidden} --validate"
+        expect: ["^setup: clusterfusion from .*/ClusterFusion__pin/clusterfusion$", "^CHECK variant=cluster2 .* ok$", "^VALIDATION PASS$"]
       kernels: ["RMSNormKernel"]
       cluster_size: 2
 scope_layer: null
 measure: {reps: 200, warmup: 20, flush_l2: true}
-notes: Do not build a cluster-1 variant - the single shift-by-1 remote atomicAdd would double the sum. Memory-bound sanity point.
+notes: >
+  Wrapper roofline/harness/workloads/clusterfusion_rmsnorm.py; built with the decoder's pin worktree
+  (ClusterFusion__pin, same build command, shared stamp). Do not build a cluster-1 variant - the single shift-by-1
+  remote atomicAdd would double the sum. FLOPs: 4 per element from the kernel code (WORKLOADS.md said ~3 before R4);
+  ncu's FP32 counters (2*FFMA + FADD + FMUL) will exceed it by ~1.4 (cluster2) and ~1.9 (flashinfer) per element:
+  shuffle-tree FADDs executed by every thread (8 elements per thread), the per-thread sum/d + eps, and flashinfer's
+  FADD of weight_bias = 0. FLASHINFER_USE_CUDA_NORM=1 (set by the wrapper) selects
+  flashinfer's CUDA kernel, enable_pdl=False; the CuTe-DSL norm kernel (flashinfer 0.7.2 default) is not measured.
+  The clusterfusion dispatcher's torch::full output fill (FillFunctor) is excluded; it calls cudaDeviceSynchronize
+  around the kernel (host time only). 2.1 MB of compulsory traffic: a latency-bound sanity point, not a bandwidth one.

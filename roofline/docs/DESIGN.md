@@ -165,4 +165,6 @@ workload,variant_id,role,scope,shape_id,rep,time_ns,wall_ns,flops,int_ops,hbm_by
   `deep_gemm/include/{cutlass,cute}`, `python3 setup.py build`, symlink `_C*.so` into `deep_gemm/` (develop.sh without the
   submodule update; R5); JIT cache `roofline/build/cache/deepgemm` (shared: the cache key includes the cluster size);
   hpc-ops `python3 {harness}/workloads/build_hpcops.py` (setup.py build_ext --inplace, SM_ARCH=90, -j16; R6);
-  _others: R4, R7_
+  ClusterFusion `python3 {harness}/workloads/build_clusterfusion.py` (stubs torch's device query to sm_90 and runs the
+  unmodified `setup.py build_ext --inplace`, MAX_JOBS=16; flashinfer JIT modules precompiled with
+  FLASHINFER_CUDA_ARCH_LIST=9.0a; R4, R7)

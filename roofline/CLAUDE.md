@@ -132,3 +132,16 @@ per task. This section replaces steps 2–3 of `../CLAUDE.md` "Starting a new co
   kernel validated (bit-identical repetitions) but failed with `LaunchFailed` under ncu kernel replay at every shape.
   Fix: the two named barriers per warpgroup, and `__syncwarp(); cute::cluster_sync();` at kernel end. Cost 0.5–2.5 %
   (e.g. llama_qo_t1024 52.34 → 52.83 µs, opt30b_fc1 464.3 → 475.9 µs). The non-DSMEM twin is unpatched.
+- 2026-10-26 (R4) ClusterFusion Llama-2-7B `LlamaDecoderLayerKernel` (sglang entry) — three races, all fixed in
+  `patches/clusterfusion__residual_out_c4_fix.patch` (the DSMEM variant; combined diff against the pin, header with the
+  evidence): (1) all 32 head clusters read `residual` and wrote `input + residual` back into it → a late reader
+  normalised the wrong vector (whole heads wrong, nondeterministic; GPU-confirmed); fix: write to a new
+  `residual_output` (as upstream's `kernel_batch_sglang.cuh`). (2) TMA double-buffer write-after-read in the Q/K/V
+  GEMV and decode loops: thread 0 refills buffer `id % 2` while warps 1–3 may still read tile `id − 2` (GPU-localised:
+  rows 32–127 of heads 6/7/30/31 only, 34/200 launches at cluster 4; 0/600 after one `block.sync()` per loop).
+  (3) `include/dsm.cuh` cluster_reduce: `src += dst` before the CTA's own outgoing `cp.async.bulk.shared::cluster` has
+  provably read `src` (no read-completion signal) → `cluster.sync()` per round + proxy/mbarrier-init fences (PTX
+  memory model; never observed failing). Cost of all fixes ≈ 1–3 %. Control `clusterfusion__cluster_size_1.patch`:
+  CLUSTER_SIZE 1 + RMSNorm prologue fix (only the last of the 4 chunks stayed in registers at cluster 1) + (1) + (2).
+  Wrapper bug found and fixed in our harness: the fused variants had been validated against a second fused launch
+  instead of the unfused sequence (determinism only); all fused validations were re-run against the unfused reference.

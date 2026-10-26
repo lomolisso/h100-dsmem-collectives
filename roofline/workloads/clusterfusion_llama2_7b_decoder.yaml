@@ -4,43 +4,151 @@ model: Llama-2-7B single-token decode, fp16, one decoder layer's attention block
 runnable: true
 precision: fp16_tensor
 scope_operator:
-  description: RMSNorm + QKV GEMV + RoPE + flash-decoding over the KV cache + O-projection, all 32 heads
+  description: RMSNorm (+ residual add) + QKV GEMV + NEOX RoPE + KV append + flash-decoding over the KV cache (S cached tokens + the new one) + O-projection, all 32 heads
   shapes:
-    s1k:  {hidden: 4096, heads: 32, head_dim: 128, seq_len: 1024}
-    s4k:  {hidden: 4096, heads: 32, head_dim: 128, seq_len: 4096}
-    s16k: {hidden: 4096, heads: 32, head_dim: 128, seq_len: 16384}
-  flops: "2*hidden*3*hidden + 4*seq_len*heads*head_dim + 2*hidden*hidden + 4*hidden"
-  min_hbm_bytes: "2*(3*hidden*hidden + hidden*hidden) + 2*2*seq_len*hidden + 2*4*hidden"
-  validate: {reference: "tests/test_llama.py::llama_decode (flashinfer + torch) attention output", tolerance: "max abs 2e-2 fp16, MAE 1e-3"}
+    s1k:  {hidden: 4096, heads: 32, head_dim: 128, seq_len: 1024, ffn: 11008}
+    s4k:  {hidden: 4096, heads: 32, head_dim: 128, seq_len: 4096, ffn: 11008}
+    s16k: {hidden: 4096, heads: 32, head_dim: 128, seq_len: 16384, ffn: 11008}
+  # QKV 2*h*3h + O 2*h*h; attention over S+1 tokens: q.k and p.v 4*(S+1)*heads*head_dim, softmax scale/sub/sum
+  # 3*(S+1)*heads (exp2 on the MUFU, max not counted); RMSNorm with residual add 5*h (add, x^2 FFMA, 2 FMUL);
+  # RoPE on q and k 3 per element = 6*h  (kernel_sglang.cuh)
+  flops: "8*hidden*hidden + 4*(seq_len+1)*heads*head_dim + 3*(seq_len+1)*heads + 11*hidden"
+  # fp16 weights W_qkv + W_o 2*4*h*h; K and V cache read 2*2*S*h; input, residual read + write, rms weight, output,
+  # new k and v: 2*7*h; cos/sin (fp32, 64 values each) 4*head_dim
+  min_hbm_bytes: "8*hidden*hidden + 4*seq_len*hidden + 14*hidden + 4*head_dim"
+  validate:
+    reference: "unfused sequence of tests/test_llama.py::llama_decode (flashinfer + torch, KV append instead of torch.cat) on identical inputs, for fused_c1 and fused_c4 (20 launches each on identical inputs, fresh residual copy); the unfused variant against an fp32 torch implementation of the same maths"
+    tolerance: "attention-block output o: max abs 2e-2, MAE 1e-3 (upstream figures) and rel. L2 1e-2; new-token k (after RoPE) and v: rel. L2 1e-2 and max abs 2e-2*max|ref|; returned residual == half(input + residual) bit-exactly and (fused) input residual unchanged; (fused) k, v, residual bit-identical across the 20 launches (o only reported: fp16 atomicAdd order over heads); every launch; plus the kernel audit (every kernel of one step matches `kernels` or is a declared exclusion)"
   variants:
     - id: unfused
       role: non_dsmem
-      description: unfused sequence flashinfer.fused_add_rmsnorm -> nn.Linear QKV -> torch NEOX RoPE -> flashinfer.single_decode_with_kv_cache -> nn.Linear O-proj
-      build: {cwd: third_party/ClusterFusion, cmd: "pip install flashinfer-python; pip install -e ."}
-      run:   {cwd: third_party/ClusterFusion, cmd: "python -c 'from tests.test_llama import llama_decode' # agent wraps llama_decode for seq_len={seq_len}"}
-      kernels: ["rmsnorm|RMSNorm", "gemv|gemm|cutlass|cublas", "rotary|rope", "SingleDecode|decode", ".*"]
+      description: flashinfer.fused_add_rmsnorm -> F.linear QKV (cuBLAS) -> torch NEOX RoPE (12 elementwise/cat kernels) -> KV append (2 copies) -> flashinfer.single_decode_with_kv_cache(use_tensor_cores=False) -> F.linear O-proj
+      build: {cwd: third_party/ClusterFusion, cmd: "python3 {harness}/workloads/build_clusterfusion.py", env: {MAX_JOBS: "16"}}
+      run:
+        cmd: "python3 {harness}/workloads/clusterfusion_llama2_7b_decoder.py --variant unfused --hidden {hidden} --heads {heads} --head_dim {head_dim} --seq_len {seq_len} --ffn {ffn} --warmup {warmup} --iters {iters}"
+      validate:
+        cmd: "python3 {harness}/workloads/clusterfusion_llama2_7b_decoder.py --variant unfused --hidden {hidden} --heads {heads} --head_dim {head_dim} --seq_len {seq_len} --ffn {ffn} --validate"
+        expect: ["^CHECK variant=unfused .*failed=0 ", "^VALIDATION PASS$"]
+      # flashinfer CUDA norm kernel; cuBLAS GEMV/GEMM names (gemv2T/gemvx, nvjet_*, sm90_xmma_*, cutlass, split-K
+      # reduce); torch elementwise kernels of RoPE / KV append (neg, mul, add, cast, copy) and the cat; flashinfer
+      # decode kernel (+ the merge kernel of its partition-kv path for S > 256)
+      kernels: ["FusedAddRMSNormKernel", "gemv|gemm|nvjet|splitKreduce|cutlass|xmma|cublas", "elementwise_kernel|CatArrayBatchedCopy", "SingleDecodeWithKVCacheKernel|MergeStates|AttentionSumKernel"]
       cluster_size: null
     - id: fused_c1
       role: control
-      description: same fused kernel rebuilt with CLUSTER_SIZE 1 (fusion without DSMEM; one CTA per head)
-      build: {cwd: third_party/ClusterFusion, cmd: "git apply ../../roofline/patches/clusterfusion__cluster_size_1.patch && pip install -e .", patch: patches/clusterfusion__cluster_size_1.patch}
-      run:   {cwd: third_party/ClusterFusion, cmd: "python -c 'import clusterfusion; clusterfusion.llama_decoder_layer_sglang(...)' # agent script, seq_len={seq_len}"}
+      description: same fused kernel rebuilt with CLUSTER_SIZE 1 + RMSNorm-prologue fix + residual_out fix + TMA-buffer WAR fix (patches/clusterfusion__cluster_size_1.patch; fusion without DSMEM; one CTA per head, 32 CTAs)
+      build: {cwd: third_party/ClusterFusion, patch: patches/clusterfusion__cluster_size_1.patch, cmd: "python3 {harness}/workloads/build_clusterfusion.py", env: {MAX_JOBS: "16"}}
+      run:
+        cmd: "python3 {harness}/workloads/clusterfusion_llama2_7b_decoder.py --variant fused_c1 --hidden {hidden} --heads {heads} --head_dim {head_dim} --seq_len {seq_len} --ffn {ffn} --warmup {warmup} --iters {iters}"
+        pythonpath: ["{worktree}"]
+      validate:
+        cmd: "python3 {harness}/workloads/clusterfusion_llama2_7b_decoder.py --variant fused_c1 --hidden {hidden} --heads {heads} --head_dim {head_dim} --seq_len {seq_len} --ffn {ffn} --validate"
+        expect: ["^setup: clusterfusion from .*/ClusterFusion__clusterfusion__cluster_size_1/clusterfusion$", "^CHECK variant=fused_c1 .*failed=0 ", "^VALIDATION PASS$"]
       kernels: ["LlamaDecoderLayerKernel"]
       cluster_size: 1
     - id: fused_c4
       role: dsmem
-      description: shipped fused kernel, cluster of 4 CTAs per head, DSMEM AllReduce (bulk push + remote atomics)
-      build: {cwd: third_party/ClusterFusion, cmd: "pip install -e ."}
-      run:   {cwd: third_party/ClusterFusion, cmd: "python -c 'import clusterfusion; clusterfusion.llama_decoder_layer_sglang(...)' # agent script, seq_len={seq_len}"}
+      description: shipped fused kernel + residual_out fix + TMA-buffer WAR fix + dsm.cuh cluster_reduce hardening (patches/clusterfusion__residual_out_c4_fix.patch), cluster of 4 CTAs per head (128 CTAs), DSMEM AllReduce (bulk push + remote atomics)
+      build: {cwd: third_party/ClusterFusion, patch: patches/clusterfusion__residual_out_c4_fix.patch, cmd: "python3 {harness}/workloads/build_clusterfusion.py", env: {MAX_JOBS: "16"}}
+      run:
+        cmd: "python3 {harness}/workloads/clusterfusion_llama2_7b_decoder.py --variant fused_c4 --hidden {hidden} --heads {heads} --head_dim {head_dim} --seq_len {seq_len} --ffn {ffn} --warmup {warmup} --iters {iters}"
+        pythonpath: ["{worktree}"]
+      validate:
+        cmd: "python3 {harness}/workloads/clusterfusion_llama2_7b_decoder.py --variant fused_c4 --hidden {hidden} --heads {heads} --head_dim {head_dim} --seq_len {seq_len} --ffn {ffn} --validate"
+        expect: ["^setup: clusterfusion from .*/ClusterFusion__clusterfusion__residual_out_c4_fix/clusterfusion$", "^CHECK variant=fused_c4 .*failed=0 ", "^VALIDATION PASS$"]
       kernels: ["LlamaDecoderLayerKernel"]
       cluster_size: 4
+  # ---- layer scope (DESIGN §1): the operator variant + the rest of the decoder layer (scope_layer), same inputs
+    - id: unfused_layer
+      role: non_dsmem
+      scope: layer
+      description: unfused + layer tail (fused_add_rmsnorm, gate|up GEMV, silu_and_mul, down GEMV)
+      build: {cwd: third_party/ClusterFusion, cmd: "python3 {harness}/workloads/build_clusterfusion.py", env: {MAX_JOBS: "16"}}
+      run:
+        cmd: "python3 {harness}/workloads/clusterfusion_llama2_7b_decoder.py --variant unfused --scope layer --hidden {hidden} --heads {heads} --head_dim {head_dim} --seq_len {seq_len} --ffn {ffn} --warmup {warmup} --iters {iters}"
+      validate:
+        cmd: "python3 {harness}/workloads/clusterfusion_llama2_7b_decoder.py --variant unfused --scope layer --hidden {hidden} --heads {heads} --head_dim {head_dim} --seq_len {seq_len} --ffn {ffn} --validate"
+        expect: ["^CHECK variant=unfused scope=layer .*failed=0 ", "^VALIDATION PASS$"]
+      kernels: ["FusedAddRMSNormKernel", "gemv|gemm|nvjet|splitKreduce|cutlass|xmma|cublas", "elementwise_kernel|CatArrayBatchedCopy", "SingleDecodeWithKVCacheKernel|MergeStates|AttentionSumKernel", "act_and_mul_kernel"]
+      cluster_size: null
+    - id: fused_c1_layer
+      role: control
+      scope: layer
+      description: fused_c1 + the same layer tail
+      build: {cwd: third_party/ClusterFusion, patch: patches/clusterfusion__cluster_size_1.patch, cmd: "python3 {harness}/workloads/build_clusterfusion.py", env: {MAX_JOBS: "16"}}
+      run:
+        cmd: "python3 {harness}/workloads/clusterfusion_llama2_7b_decoder.py --variant fused_c1 --scope layer --hidden {hidden} --heads {heads} --head_dim {head_dim} --seq_len {seq_len} --ffn {ffn} --warmup {warmup} --iters {iters}"
+        pythonpath: ["{worktree}"]
+      validate:
+        cmd: "python3 {harness}/workloads/clusterfusion_llama2_7b_decoder.py --variant fused_c1 --scope layer --hidden {hidden} --heads {heads} --head_dim {head_dim} --seq_len {seq_len} --ffn {ffn} --validate"
+        expect: ["^setup: clusterfusion from .*/ClusterFusion__clusterfusion__cluster_size_1/clusterfusion$", "^CHECK variant=fused_c1 scope=layer .*failed=0 ", "^VALIDATION PASS$"]
+      kernels: ["LlamaDecoderLayerKernel", "FusedAddRMSNormKernel", "gemv|gemm|nvjet|splitKreduce|cutlass|xmma|cublas", "act_and_mul_kernel"]
+      cluster_size: 1
+    - id: fused_c4_layer
+      role: dsmem
+      scope: layer
+      description: fused_c4 + the same layer tail
+      build: {cwd: third_party/ClusterFusion, patch: patches/clusterfusion__residual_out_c4_fix.patch, cmd: "python3 {harness}/workloads/build_clusterfusion.py", env: {MAX_JOBS: "16"}}
+      run:
+        cmd: "python3 {harness}/workloads/clusterfusion_llama2_7b_decoder.py --variant fused_c4 --scope layer --hidden {hidden} --heads {heads} --head_dim {head_dim} --seq_len {seq_len} --ffn {ffn} --warmup {warmup} --iters {iters}"
+        pythonpath: ["{worktree}"]
+      validate:
+        cmd: "python3 {harness}/workloads/clusterfusion_llama2_7b_decoder.py --variant fused_c4 --scope layer --hidden {hidden} --heads {heads} --head_dim {head_dim} --seq_len {seq_len} --ffn {ffn} --validate"
+        expect: ["^setup: clusterfusion from .*/ClusterFusion__clusterfusion__residual_out_c4_fix/clusterfusion$", "^CHECK variant=fused_c4 scope=layer .*failed=0 ", "^VALIDATION PASS$"]
+      kernels: ["LlamaDecoderLayerKernel", "FusedAddRMSNormKernel", "gemv|gemm|nvjet|splitKreduce|cutlass|xmma|cublas", "act_and_mul_kernel"]
+      cluster_size: 4
 scope_layer:
-  description: full decoder layer = operator region + FFN (gate/up 4096->11008, SiLU, down 11008->4096) + residual adds + second RMSNorm
-  extra_kernels: ["nn.Linear gate/up/down (cuBLAS GEMV)", "silu_and_mul", "fused_add_rmsnorm"]
-  run: {cwd: third_party/ClusterFusion, cmd: "chat/llama/model.py TransformerBlock forward pieces, same inputs; agent script"}
+  description: "one decoder layer (sglang decomposition) = operator region + fused_add_rmsnorm(o, residual) (residual add + post-attention RMSNorm) + merged gate|up GEMV (4096 -> 2*11008) + silu_and_mul + down GEMV (11008 -> 4096); the FFN residual add is the next layer's first fused_add_rmsnorm (the region's first step), so every add is counted once per layer. Measured by the `scope: layer` variants (`<operator id>_layer`), whose kernels = the operator variant's + extra_kernels"
+  extra_kernels: ["FusedAddRMSNormKernel", "gemv|gemm|nvjet|splitKreduce|cutlass|xmma|cublas", "act_and_mul_kernel"]
+  # operator flops + post-norm 5*h + gate|up 4*ffn*h + down 2*ffn*h + silu*mul 4*ffn
+  flops: "8*hidden*hidden + 6*ffn*hidden + 4*(seq_len+1)*heads*head_dim + 3*(seq_len+1)*heads + 16*hidden + 4*ffn"
+  # operator bytes + FFN weights 2*3*ffn*h + post-norm weight and layer output 2*2*h
+  min_hbm_bytes: "8*hidden*hidden + 6*ffn*hidden + 4*seq_len*hidden + 18*hidden + 4*head_dim"
+  validate:
+    reference: "layer output (down projection) of unfused_layer on identical inputs (fused layer variants); fp32 torch (unfused_layer)"
+    tolerance: "operator-scope criteria plus layer output rel. L2 1e-2 and max abs 2e-2*max|ref|"
 measure: {reps: 100, warmup: 20, flush_l2: true}
 notes: >
-  Dispatchers call cudaDeviceSynchronize and re-encode TMA maps per call: time with ncu/nsys only.
-  Only cluster sizes 1 and 4 are correct in the shipped reduce loop. kernel_sglang.cuh updates `residual`
-  in place from every head cluster; validate the attention output, not residual. The TileLang port
-  (tilelang_llama.py, cluster_size=1) is an optional extra control, marked untested by the authors.
+  Wrapper roofline/harness/workloads/clusterfusion_llama2_7b_decoder.py (docstring: dataflow, in-place updates, KV
+  append). Build: build_clusterfusion.py runs the unmodified setup.py build_ext --inplace in the worktree with the
+  torch.cuda device queries stubbed to sm_90 (setup.py reads the device at import; no GPU in --no-gpu builds) and
+  pre-compiles the flashinfer JIT modules (norm, single decode, silu_and_mul) into roofline/build/cache/flashinfer.
+  Worktrees: ClusterFusion__pin (unfused, unfused_layer; the extension is built there but not imported),
+  ClusterFusion__clusterfusion__residual_out_c4_fix (fused_c4, fused_c4_layer) and ClusterFusion__clusterfusion__cluster_size_1
+  (fused_c1, fused_c1_layer); validate.expect checks which extension was imported.
+  Residual race (confirmed on GPU 3 in R4): upstream kernel_sglang.cuh writes input + residual back into `residual`
+  from every one of the 32 head clusters; a CTA that reads after another cluster's write normalises 2*input +
+  residual, so on each call a few random heads get wrong q/k/v (whole head; k_new/v_new rel. L2 ~8 %), at cluster 4
+  and cluster 1, and repeated calls are not bit-identical (a later correct write hides it in `residual`). Both fused
+  builds therefore carry the residual_out fix: the sum goes to a new residual_output tensor (torch::empty_like, no
+  kernel) that the dispatcher returns in place of `residual`, which is only read - the pattern of upstream's own
+  kernel_batch_sglang.cuh. The Python signature is unchanged; the kernel's work is unchanged (one 16-byte store per
+  thread, to another address).
+  TMA-buffer race (confirmed on GPU 3 in R4, cluster 4 only): with the residual fix, fused_c4 still failed 1-5 of 20
+  launches per shape. A 200-launch diagnostic (roofline/build/scratch_c4fix2/diag.py) localised it: one head of
+  {6, 7, 30, 31} per failing launch, wrong k or v in whole 32-row blocks of warps 1-3 of the QKV GEMV (never warp 0,
+  which contains tid 0). Upstream's GEMV and flash-decoding loops let tid 0 refill TMA buffer id % 2 before the other
+  warps have finished reading tile id - 2 from it; a block.sync() at the top of the four loops removes it (0 of 600
+  launches deviate at S = 1k/4k/16k; kernel +0.1 to +1.1 %). Only cluster 4 shows it: ~101 KB of dynamic shared
+  memory lets two CTAs share an SM, and some clusters (those four heads) are packed that way. fused_c1 carries the
+  same four lines (not needed there, 0/600 without them) so both fused builds run the same code.
+  dsm.cuh hardening (fused_c4 only): cluster_reduce lets a CTA overwrite its bulk-push source before its outgoing copy
+  is known to have been read (no completion for that), and lacks the proxy / mbarrier-init fences the PTX ISA
+  requires; one extra cluster.sync per round + fences. Required by the memory model, not observed on the GPU
+  (+0.7 to +1.5 % kernel time). The measured fused_c4 is therefore "shipped kernel + the race fixes"; details and
+  evidence in the patch headers.
+  fused_c1: upstream's CLUSTER_SIZE 1 build is also wrong in the RMSNorm prologue (keeps x+residual only in the
+  registers of the last loop iteration, correct only for DIM_PER_BLOCK = 4096/CLUSTER_SIZE = 1024, i.e. cluster 4);
+  patches/clusterfusion__cluster_size_1.patch is the combined diff pin + CLUSTER_SIZE 1 + prologue fix + residual_out
+  fix + TMA-buffer WAR fix (see its header). Only cluster sizes 1 (patched) and 4 are correct (2 runs zero reduce rounds, >= 8
+  double-counts).
+  Kernels: the unfused regexes are broad on purpose (cuBLAS picks its GEMV kernel at run time); the wrapper's step
+  launches only region kernels, and the validation's kernel audit (kernel_audit.py, torch.profiler) fails if any
+  kernel of one step is unmatched; it prints KERNELS_PER_ITER for the comparison with the runner's kernels_n
+  (expected ~17-20 for unfused: 1 norm + 2-4 cuBLAS + 13 torch elementwise/cat + 1-2 decode). The fused dispatcher's
+  3 torch::full zero-fills (o, k, v; FillFunctor, 8 KB each) are excluded from the region; the fused variants count
+  only LlamaDecoderLayerKernel. Dispatchers call cudaDeviceSynchronize and re-encode 4 TMA maps per call: host time
+  only, kernel durations are measured (nsys/ncu). FLASHINFER_USE_CUDA_NORM=1 (CUDA norm kernels, set by the
+  wrapper; the CuTe-DSL norm path of flashinfer 0.7.2 is not measured); enable_pdl=False for every flashinfer call.
+  Precision: the fused kernel computes on CUDA cores (fp16 loads, fp32 FFMA); the field keeps fp16_tensor (the point
+  is far below both ceilings). The TileLang port (tilelang_llama.py, cluster_size=1) is not measured.
