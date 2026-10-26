@@ -35,14 +35,16 @@ so a measured compute ceiling below them is expected; state both clocks in the n
 |---|---|---|
 | HBM bandwidth | microbench 05 `bw_dram.cu` `k4` (read / write / copy over 2 GiB, 4 × 132 × 1024 threads, `CleanL2` before each launch), locked clock; report read, write and copy GB/s | 3.9 TB/s HBM3 |
 | L2 bandwidth | microbench 05 `bw_l2.cu` `k3_direct`: repeated reads of a 16–24 MB working set (fits the 60 MiB L2), all SMs | — |
-| L1/SMEM bandwidth | microbench 05 `bw_smem_l1.cu` `k12`: per-SM shared-memory read rate (iteration-slope method) × SM count (132) | 33 TB/s class |
-| DSMEM bandwidth | R1's own aggregate microbenchmark: max active clusters at 1 CTA/SM, CS = 2…16, every CTA streaming from a peer (`ld.shared::cluster.v4` pull and bulk push), best CS and direction, cross-checked with the `dshared` byte counters. Independent of `../collectives/`; its results, when they exist, are an optional cross-check only | — |
-| FP32 CUDA-core peak | FMA-chain kernel, all SMs | 67 TFLOP/s |
-| FP16/BF16 tensor-core peak (dense) | large cuBLAS GEMM (8192³) best of 10 | 989 TFLOP/s dense |
-| FP8 tensor-core peak | DeepGEMM / cuBLASLt FP8 GEMM best of 10 | 1979 TFLOP/s dense |
+| L1/SMEM bandwidth | microbench 05 `bw_smem_l1.cu` `k12`: per-SM shared-memory read rate (iteration-slope method) × SM count (132) | — |
+| DSMEM bandwidth | aggregate microbenchmark vendored from microbench 11 (`k_stream`; user decision in the R0–R8 plan, instead of a new kernel): max active clusters at 1 CTA/SM, CS = 2…16, every CTA streaming from a peer (`ld.shared::cluster.v4` pull and bulk push), best CS and direction, cross-checked with the `dshared` byte counters. Independent of `../collectives/` | — |
+| FP32 CUDA-core peak | FMA-chain kernel, all SMs | 60 TFLOP/s |
+| FP16/BF16 tensor-core peak (dense) | large cuBLAS GEMM (8192³) best of 10 | 835.5 TFLOP/s dense (1671 with sparsity) |
+| FP8 tensor-core peak | cuBLASLt FP8 GEMM (`torch._scaled_mm`) best of 10 | 1670.5 TFLOP/s dense (3341 with sparsity) |
 | INT32 peak | IMAD-chain kernel (for the top-k workload) | — |
 
-Each ceiling row carries `method` and `source` (`measured` or `datasheet`). Ridge points
+Each ceiling row carries `method` and `source` (`measured` or `datasheet`). The datasheet column is the H100 NVL (PNY /
+NVIDIA datasheet, per GPU, at the 1785 MHz maximum clock; tensor-core figures there are quoted with sparsity, dense =
+half); the first version of this table listed the H100 SXM values (67 / 989 / 1979), corrected in R1. Ridge points
 (intensity where compute = memory) are computed in the notebook from the measured values.
 
 ### 2.2 Point coordinates
@@ -137,6 +139,18 @@ workload,variant_id,role,scope,shape_id,rep,time_ns,wall_ns,flops,int_ops,hbm_by
 - Versions (R0 smoke on GPU 3): driver 580.126.20, CUDA 12.9.1 / nvcc 12.9.86, Nsight Compute 2025.2.1.0,
   Python 3.12.3, PyTorch 2.11.0+cu129 (cuDNN 9.17.1), Triton 3.6.0, flashinfer-python 0.7.2.post1 (JIT kernels).
 - Clock state: SM clock locked by `tools/run --profile --lock-sm-mhz <LOCK>` on GPU 3 (value from
-  h100-microbench `docs/context/10` §2), memory clock 2619 MHz, never changed. Value used: _TODO (R1)_
-- Exact ncu metric names used for each byte level (after `ncu --query-metrics`) and the DSMEM payload rule: _TODO (R1)_
+  h100-microbench `docs/context/10` §2), memory clock 2619 MHz, never changed. Value used: **1635 MHz** (R1: every ceiling launch at 1635 MHz; sustained
+  8192³ tensor-core GEMMs back to back pull the clock below the lock through the 400 W limit, so `ceilings_tc.py` idles
+  1 s before every timed GEMM and 10 s before every configuration).
+- ncu metric names (R1/R2, all listed by `ncu --query-metrics` of ncu 2025.2.1 on GPU 3): HBM `dram__bytes_read.sum` +
+  `dram__bytes_write.sum`; L2 `lts__t_bytes.sum`; L1/SMEM `l1tex__t_bytes.sum` + 128 ×
+  `l1tex__data_pipe_lsu_wavefronts_mem_shared_op_{ld,st}.sum`; DSMEM `l1tex__m_l1tex2xbar_write_bytes_mem_dshared.sum`
+  (payload rule, verified in R1 on the DSMEM ceiling kernel: pull and bulk push both count each payload byte once in
+  `l1tex2xbar_write` and once in `xbar2l1tex_read`, ratio 1.000 for CS 2–16, as collectives C1 found); TMA multicast
+  `l1tex__m_xbar2l1tex_read_bytes_mem_global_op_tma_ld_dest_multicast.sum`; FP32 work `2·…_op_ffma_pred_on + …_op_fadd_pred_on +
+  …_op_fmul_pred_on` (`sm__sass_thread_inst_executed_…`, exact on the FFMA ceiling kernel); integer
+  `sm__sass_thread_inst_executed_op_integer_pred_on.sum`; tensor cores `sm__inst_executed_pipe_tensor_op_gmma.sum` (= `…_hmma.sum` on
+  SM90 cuBLAS kernels); time `gpu__time_duration.sum`. Not listed (dropped): `launch__grid_size`, `launch__cluster_dim_x`,
+  `launch__block_size` as metrics. Write traffic still dirty in L2 at kernel end is missing from `dram__bytes_write`
+  (−1.4 % on the 2 GiB write ceiling, more for outputs that fit L2).
 - Build commands actually used per artifact: _TODO (R2–R7, one line per artifact)_
