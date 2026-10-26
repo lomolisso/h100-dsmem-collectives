@@ -195,19 +195,17 @@ def fig_ceilings(C=None, save=None):
         if name not in C.index or name not in colors:
             continue
         v = float(C.loc[name, "value"])
-        ax.plot(x, np.minimum(v, hbm * x), color=colors[name], lw=2, label=f"{label} {v / 1e12:.0f} T/s")
+        ax.plot(x, np.minimum(v, hbm * x), color=colors[name], lw=2, label=f"{label} {v / 1e12:.0f} T op/s")
         pl = name.replace("_peak", "_power_limited")
         if pl in C.index:
             vp = float(C.loc[pl, "value"])
             ax.plot(x, np.minimum(vp, hbm * x), color=colors[name], lw=1.2, ls="--")
-    for name, label in MEMORY[:-1]:
+    for (name, label), ls in zip(MEMORY[:-1], [":", "-.", "--"]):
         if name in C.index:
             bw = float(C.loc[name, "value"])
             y = bw * x
-            ax.plot(x[y < 1.2e15], y[y < 1.2e15], color="0.6", lw=1, ls="--")
-            xi = 3e12 / bw
-            ax.text(xi, bw * xi * 1.15, f"{label} {bw / 1e12:.1f} TB/s", color="0.4", fontsize=8, rotation=37)
-    ax.text(0.012, hbm * 0.012 * 1.3, f"HBM {hbm / 1e12:.2f} TB/s", fontsize=8, rotation=37)
+            ax.plot(x[y < 1.2e15], y[y < 1.2e15], color="0.55", lw=1, ls=ls, label=f"{label} {bw / 1e12:.1f} TB/s")
+    ax.plot([], [], color="0.2", lw=2, label=f"HBM {hbm / 1e12:.2f} TB/s (slope of every roof)")
     ax.set(xscale="log", yscale="log", xlabel="operational intensity (FLOP or int op per HBM byte)",
            ylabel="throughput (FLOP/s or int op/s)", ylim=(1e10, 3e15), xlim=(1e-2, 1e4))
     ax.legend(loc="lower right", fontsize=8, title=f"measured at {lock_mhz(C)} MHz; dashed: power-limited (real data)",
@@ -575,3 +573,256 @@ def table_sol_check(L=None):
     t.columns = ["throughput", "DRAM intensity", "work", "time (nsys / ncu)", "DRAM bytes"]
     return t.sort_index().style.format("{:.2f}").map(
         lambda v: "color: #b00" if isinstance(v, float) and abs(v - 1) > 0.10 else "", subset=["throughput", "DRAM intensity"])
+
+
+# ---------------------------------------------------------------- revision after review (R8): leaner figures
+# How each workload uses the cluster / DSMEM (from the kernel code; docs/WORKLOADS.md, kernels/*.cu docstrings).
+DSMEM_USE = {
+    "credit": ("P = 2, 4, 8 CTAs per row", "each CTA keeps 1/P of the row in its shared memory; the row statistics (1–3 floats "
+               "per pass) are all-reduced by pushing them into every peer's shared memory (st.shared::cluster) + cluster barrier",
+               "re-reading the row from HBM/L2 once per pass"),
+    "dak_gemm_multicast": ("2 CTAs per output tile", "TMA multicast: one L2 read of each 8 KB weight tile lands in both CTAs' shared "
+                           "memory; the peer frees the buffer slot with a remote mbarrier arrive", "each CTA loading the tile from L2"),
+    "deepgemm_fp8_gemm_multicast": ("2 CTAs", "TMA multicast of the A or B tile into both CTAs", "each CTA loading the tile from L2"),
+    "hpcops_topk_cluster8": ("8 CTAs per row", "each CTA scans 1/8 of the row; histograms (2048 bins) and candidate counts are "
+                             "combined through remote shared-memory accesses + cluster barriers", "one CTA scanning the whole row"),
+    "clusterfusion_llama2_7b_decoder": ("4 CTAs per head (32 clusters)", "each CTA computes 1/4 of a head's GEMVs and attention; "
+                                        "partial q|k|v (768 B) and attention outputs (256 B) are all-reduced by bulk-copy pushes, "
+                                        "norm / softmax scalars by remote atomics", "18 kernels handing results over in global memory"),
+    "clusterfusion_deepseek_v2_lite_mla": ("4 CTAs per head (16 clusters)", "as Llama, plus an all-gather of the latent query",
+                                           "10 kernels handing results over in global memory"),
+    "clusterfusion_rmsnorm": ("2 CTAs per row", "one remote atomicAdd of the partial sum of squares + 2 cluster barriers",
+                              "one CTA per row"),
+    "fa4_bwd_2cta_ds_exchange": ("2 CTAs (B200)", "half of dS (16 KB) bulk-copied into the peer every iteration",
+                                 "each CTA computing / storing the full dS tile"),
+}
+
+
+def dsmem_use(w):
+    for k, v in DSMEM_USE.items():
+        if w.startswith(k):
+            return v
+    return ("", "", "")
+
+
+def table_dsmem_use(L):
+    """How every workload uses the cluster, and how much it sends over the SM-to-SM network (DSMEM version, overview
+    shape)."""
+    B = L["markers"]
+    rows = []
+    for w in L["M"]:
+        cl, what, repl = dsmem_use(w)
+        s = OVERVIEW_SHAPES.get(w, "n64k")
+        g = B[(B.workload == w) & (B.shape_id == s) & (B.role == "dsmem") & (B.scope == "operator")]
+        r = {"workload": short_name(w), "cluster": cl, "what goes through DSMEM / the cluster": what, "replaces": repl}
+        if len(g):
+            g = g.iloc[0]
+            r["DSMEM KB per run"] = g.dsmem_bytes / 1e3
+            r["multicast MB per run"] = g.multicast_bytes / 1e6 if g.multicast_bytes == g.multicast_bytes else np.nan
+            r["HBM MB per run"] = g.hbm_bytes / 1e6
+        rows.append(r)
+    t = pd.DataFrame(rows).set_index("workload")
+    return t.style.format({"DSMEM KB per run": "{:,.1f}", "multicast MB per run": "{:,.1f}", "HBM MB per run": "{:,.1f}"},
+                          na_rep="—").set_properties(subset=["what goes through DSMEM / the cluster"],
+                                                     **{"text-align": "left", "min-width": "380px"})
+
+
+def fig_fabric_use(L, save=None):
+    """Achieved bandwidth of the DSMEM version of every workload (overview shape): HBM, SM-to-SM (DSMEM) and TMA
+    multicast, against the measured HBM and DSMEM ceilings."""
+    C, B = L["C"], L["markers"]
+    rows = []
+    for w in L["M"]:
+        s = OVERVIEW_SHAPES.get(w, "n64k")
+        g = B[(B.workload == w) & (B.shape_id == s) & (B.role == "dsmem") & (B.scope == "operator")]
+        if len(g):
+            g = g.iloc[0]
+            t = g.time_ns * 1e-9
+            rows.append((short_name(w), g.hbm_bytes / t, g.dsmem_bytes / t, (g.multicast_bytes or 0) / t))
+    rows.sort(key=lambda r: r[2])
+    fig, ax = plt.subplots(figsize=(7.5, 5))
+    y = np.arange(len(rows))
+    ax.barh(y + 0.25, [r[1] / 1e12 for r in rows], 0.25, color="0.6", label="HBM")
+    ax.barh(y, [max(r[2], 1) / 1e12 for r in rows], 0.25, color="C0", label="DSMEM (SM to SM)")
+    ax.barh(y - 0.25, [max(r[3], 1) / 1e12 for r in rows], 0.25, color="C1", label="TMA multicast (L2 to several SMs)")
+    hb, db = float(C.loc["hbm_read_bw", "value"]) / 1e12, float(C.loc["dsmem_bw", "value"]) / 1e12
+    ax.axvline(hb, color="0.4", ls="--", lw=1)
+    ax.axvline(db, color="C0", ls="--", lw=1)
+    ax.text(hb / 1.1, len(rows) - 0.3, f"HBM ceiling {hb:.1f}", color="0.4", fontsize=7, ha="right")
+    ax.text(db * 1.1, len(rows) - 0.3, f"DSMEM {db:.1f}", color="C0", fontsize=7)
+    ax.set(yticks=y, yticklabels=[r[0] for r in rows], xscale="log", xlim=(1e-4, 30), ylim=(-0.6, len(rows) + 0.2),
+           xlabel="achieved bandwidth (TB/s)")
+    ax.legend(fontsize=8, loc="upper center", bbox_to_anchor=(0.5, -0.12), ncol=3)
+    ax.grid(True, axis="x", alpha=.3)
+    _show(fig, save)
+
+
+GROUPS = [("Row read once (CREDIT, 64K rows)", "fewer HBM bytes (row read once)"), ("TMA multicast", "TMA multicast"),
+          ("Kernel fusion (decode)", "kernel fusion"), ("More SMs per row", "more SMs per row")]
+
+
+def fig_roofline_groups(L, save=None):
+    """Classic roofline, one panel per way of using DSMEM, one shape per workload: grey circle = non-DSMEM,
+    coloured triangle = DSMEM version, arrow between them. Solid roofs: measured peak; dashed: power-limited."""
+    C, B, M = L["C"], L["markers"], L["M"]
+    B = B[B.scope == "operator"]
+    hbm = float(C.loc["hbm_read_bw", "value"])
+    fig, axs = plt.subplots(2, 2, figsize=(11, 8.5))
+    for ax, (title, mech) in zip(axs.flat, GROUPS):
+        ws = [w for w in M if M[w].get("runnable") is not False and mechanism(w) == mech]
+        pts = []
+        for i, w in enumerate(ws):
+            g = B[(B.workload == w) & (B.shape_id == OVERVIEW_SHAPES.get(w, "n64k"))].set_index("role")
+            if not {"non_dsmem", "dsmem"} <= set(g.index):
+                continue
+            a, b = g.loc["non_dsmem"], g.loc["dsmem"]
+            ax.annotate("", xy=(b.ai_hbm, b.throughput), xytext=(a.ai_hbm, a.throughput),
+                        arrowprops=dict(arrowstyle="->", color=f"C{i}", lw=1.2))
+            ax.scatter(a.ai_hbm, a.throughput, color="0.55", s=25, zorder=3)
+            ax.scatter(b.ai_hbm, b.throughput, color=f"C{i}", marker="^", s=45, zorder=4, label=short_name(w))
+            pts += [(a.ai_hbm, a.throughput), (b.ai_hbm, b.throughput)]
+        xs, ys = [p[0] for p in pts], [p[1] for p in pts]
+        lo, hi = min(xs) / 4, max(max(xs) * 8, 30)
+        x = np.logspace(np.log10(lo), np.log10(hi), 200)
+        for p in sorted({M[w]["precision"] for w in ws}):
+            roof = float(C.loc[PREC_CEIL[p], "value"])
+            ax.plot(x, np.minimum(roof, hbm * x), color="0.2", lw=1.2)
+            ax.text(hi / 1.15, roof * 1.06, {"fp32_cuda": "FP32", "fp16_tensor": "FP16 tensor", "bf16_tensor": "BF16 tensor",
+                                             "fp8_tensor": "FP8 tensor", "int32": "INT32"}[p], fontsize=7, ha="right")
+            pl = PREC_CEIL[p].replace("_peak", "_power_limited")
+            if pl in C.index:
+                ax.plot(x, np.minimum(float(C.loc[pl, "value"]), hbm * x), color="0.2", lw=.8, ls="--")
+        ymax = max(max(ys) * 3, min(hbm * hi, max(float(C.loc[PREC_CEIL[M[w]["precision"]], "value"]) for w in ws) * 1.5))
+        ax.set(xscale="log", yscale="log", xlim=(lo, hi), ylim=(min(ys) / 4, ymax), title=title,
+               xlabel="work per HBM byte", ylabel="throughput (work/s)")
+        ax.legend(fontsize=7, loc="lower right")
+        ax.grid(True, which="major", alpha=.3)
+    fig.tight_layout()
+    _show(fig, save)
+
+
+def table_credit_p(L):
+    """CREDIT: speedup over the one-CTA read kernel for every cluster size P measured (and the one-CTA staged control)."""
+    D = L["D"]
+    D = D[D.workload.str.startswith("credit") & (D.scope == "operator")]
+    rows = []
+    for (w, s), g in D.groupby(["workload", "shape_id"]):
+        base = g[g.variant_id == "block_read"].time_ns
+        if base.empty:
+            continue
+        base = float(base.iloc[0])
+        r = {"workload": short_name(w), "row": s, "one-CTA read (µs)": base / 1e3}
+        st = g[g.variant_id == "block_smem"].time_ns
+        r["one-CTA staged"] = base / float(st.iloc[0]) if len(st) else np.nan
+        for p in (2, 4, 8):
+            h = g[(g.variant_id == "cluster_smem") & (g.cluster_size == p)].time_ns
+            r[f"cluster P={p}"] = base / float(h.iloc[0]) if len(h) else np.nan
+        rows.append(r)
+    t = pd.DataFrame(rows)
+    t["row"] = pd.Categorical(t.row, ["n4k", "n16k", "n64k"])
+    t = t.sort_values(["workload", "row"]).set_index(["workload", "row"])
+    sp = ["one-CTA staged", "cluster P=2", "cluster P=4", "cluster P=8"]
+    return (t.style.format({"one-CTA read (µs)": "{:.0f}"} | {c: "{:.2f}×" for c in sp}, na_rep="—")
+            .background_gradient(cmap="RdBu", subset=sp, vmin=0.4, vmax=1.6))
+
+
+def fig_multicast(L, save=None):
+    """TMA multicast GEMMs: DSMEM / non-DSMEM ratios of time, HBM bytes and L2 bytes per shape."""
+    B = L["markers"]
+    B = B[(B.scope == "operator") & B.workload.isin(["dak_gemm_multicast", "deepgemm_fp8_gemm_multicast"])]
+    rows = []
+    for (w, s), g in B.groupby(["workload", "shape_id"]):
+        g = g.set_index("role")
+        if {"non_dsmem", "dsmem"} <= set(g.index):
+            a, b = g.loc["non_dsmem"], g.loc["dsmem"]
+            rows.append((("DAK " if w.startswith("dak") else "DeepGEMM ") + s, b.time_ns / a.time_ns,
+                         b.hbm_bytes / a.hbm_bytes, b.l2_bytes / a.l2_bytes))
+    fig, ax = plt.subplots(figsize=(7, 4.5))
+    y = np.arange(len(rows))
+    for j, (lab, mk, c) in enumerate([("time", "o", "k"), ("HBM bytes", "s", "0.6"), ("L2 bytes", "^", "C1")]):
+        ax.scatter([r[1 + j] for r in rows], y, marker=mk, color=c, s=40, label=lab, zorder=3)
+    ax.axvline(1, color="0.6", lw=1)
+    ax.set(yticks=y, yticklabels=[r[0] for r in rows], xlabel="multicast / no multicast", xlim=(0.85, 1.3))
+    ax.legend(fontsize=8, loc="upper center", bbox_to_anchor=(0.5, -0.13), ncol=3)
+    ax.grid(True, axis="x", alpha=.3)
+    _show(fig, save)
+
+
+def fig_decode_time(L, save=None):
+    """Decode attention block: kernel time of the unfused sequence, its first-start-to-last-end time when launched
+    eagerly (includes launch gaps), the fused DSMEM kernel (clusters of 4) and the fused cluster-1 control."""
+    D = L["D"]
+    D = D[D.scope == "operator"]
+    cases = [("clusterfusion_llama2_7b_decoder", s, f"Llama-2-7B\n{s[1:]} tokens") for s in ("s1k", "s4k", "s16k")]
+    cases += [("clusterfusion_deepseek_v2_lite_mla", "s4k", "DeepSeek-V2-Lite MLA\n4k tokens")]
+    bars = [("unfused: kernel time", "unfused", "time_ns", "0.6"), ("unfused: incl. launch gaps", "unfused", "wall_ns", "0.85"),
+            ("fused, cluster of 4 (DSMEM)", "fused_c4", "time_ns", "C3"), ("fused, cluster of 1", "fused_c1", "time_ns", "C1")]
+    fig, ax = plt.subplots(figsize=(8, 4.2))
+    x = np.arange(len(cases))
+    for j, (lab, v, col, c) in enumerate(bars):
+        vals = []
+        for w, s, _ in cases:
+            h = D[(D.workload == w) & (D.shape_id == s) & (D.variant_id == v)][col]
+            vals.append(float(h.iloc[0]) / 1e3 if len(h) else np.nan)
+        ax.bar(x + (j - 1.5) * 0.2, vals, 0.2, color=c, label=lab)
+    ax.set(xticks=x, xticklabels=[c[2] for c in cases], ylabel="µs per decode step")
+    ax.legend(fontsize=8)
+    ax.grid(True, axis="y", alpha=.3)
+    _show(fig, save)
+
+
+def fig_decode_bytes(L, save=None):
+    """Where the HBM bytes of one Llama-2-7B attention-block decode step come from (model: fp16 weights, K and V
+    cache, intermediates the unfused sequence writes and reads), against the measured HBM bytes."""
+    D = L["D"]
+    D = D[(D.workload == "clusterfusion_llama2_7b_decoder") & (D.scope == "operator")]
+    h = 4096
+    labels, comp = [], []
+    for s, S in (("s1k", 1024), ("s4k", 4096), ("s16k", 16384)):
+        w_b = 2 * 4 * h * h
+        kv = 2 * 2 * S * h
+        inter = 2 * (2 * h + 2 * 3 * h + 2 * 2 * h + 2 * h)  # normed x, qkv, roped q/k, attention out: written + read
+        labels.append(f"{S} tokens")
+        comp.append((w_b, kv, inter, [float(D[(D.shape_id == s) & (D.variant_id == v)].hbm_bytes.iloc[0])
+                                      for v in ("unfused", "fused_c4")]))
+    fig, ax = plt.subplots(figsize=(7.5, 3.2))
+    y = np.arange(len(labels))
+    ax.barh(y, [c[0] / 1e6 for c in comp], color="0.55", label="weights (QKV, O)")
+    ax.barh(y, [c[1] / 1e6 for c in comp], left=[c[0] / 1e6 for c in comp], color="C0", label="K and V cache")
+    ax.barh(y, [c[2] / 1e6 for c in comp], left=[(c[0] + c[1]) / 1e6 for c in comp], color="C3",
+            label="intermediates (what fusion removes)")
+    ax.scatter([c[3][0] / 1e6 for c in comp], y + 0.25, marker="|", s=200, color="k", label="measured, unfused")
+    ax.scatter([c[3][1] / 1e6 for c in comp], y - 0.25, marker="|", s=200, color="C3", label="measured, fused")
+    ax.set(yticks=y, yticklabels=labels, xlabel="HBM MB per decode step", xlim=(0, 470))
+    ax.text(5, 2.45, f"intermediates: {comp[0][2] / 1e3:.0f} KB per step ({100 * comp[0][2] / (comp[0][0] + comp[0][1]):.2f} % "
+            "of the bytes at 1k tokens), too small to see", fontsize=7, color="C3")
+    ax.set_ylim(-0.5, 2.8)
+    ax.legend(fontsize=7, loc="upper center", bbox_to_anchor=(0.5, -0.22), ncol=3)
+    _show(fig, save)
+
+
+def fig_reuse_model(L, save=None):
+    """Model: operational intensity of the Llama-2-7B attention block (fp16) versus the number of sequences decoded
+    together (batch), for its two parts. Only reuse of the bytes read from HBM raises the intensity."""
+    C = L["C"]
+    hbm = float(C.loc["hbm_read_bw", "value"])
+    b = np.logspace(0, 3, 100)
+    h, S = 4096, 4096
+    P = 4 * h * h                                  # weights of QKV + O
+    gemv = b * 2 * P / (2 * P)                     # each weight (2 B) used for 2 FLOP per sequence
+    attn = np.ones_like(b)                         # each sequence has its own K/V: 4 S h FLOP per 4 S h bytes
+    block = b * (2 * P + 4 * S * h) / (2 * P + b * 4 * S * h)
+    fig, ax = plt.subplots(figsize=(6.5, 4.2))
+    ax.plot(b, gemv, color="0.4", label="QKV / O projections (weights shared by the batch)")
+    ax.plot(b, attn, color="C0", label="attention over the KV cache (not shared)")
+    ax.plot(b, block, color="C3", lw=2, label="whole attention block, 4k-token context")
+    for name, lab in [("fp16_tc_peak", "FP16 tensor ridge"), ("fp32_peak", "FP32 ridge")]:
+        r = float(C.loc[name, "value"]) / hbm
+        ax.axhline(r, color="0.7", ls="--", lw=1)
+        ax.text(1.1, r * 1.08, f"{lab} ({r:.0f} FLOP/B)", fontsize=7, color="0.4")
+    ax.scatter([1], [1.0], color="k", zorder=4, label="measured (batch 1, both versions)")
+    ax.set(xscale="log", yscale="log", xlabel="sequences decoded together (batch)", ylabel="FLOP per HBM byte",
+           ylim=(0.5, 500))
+    ax.legend(fontsize=7, loc="upper center", bbox_to_anchor=(0.5, -0.15), ncol=2)
+    ax.grid(True, which="major", alpha=.3)
+    _show(fig, save)
