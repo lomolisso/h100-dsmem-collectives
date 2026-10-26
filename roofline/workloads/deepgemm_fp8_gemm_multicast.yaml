@@ -4,39 +4,94 @@ model: DeepSeek-V3 style FP8 GEMM and MoE grouped GEMM, SM90 1Dx2D block scaling
 runnable: true
 precision: fp8_tensor
 scope_operator:
-  description: D = A . B^T with fp8 e4m3 inputs and fp32 per-128-channel scales; cluster of 2 shares the A or B tile via TMA multicast
-  shapes:
-    m4096_n4096_k7168: {m: 4096, n: 4096, k: 7168, groups: 1}
-    m4096_n7168_k2048: {m: 4096, n: 7168, k: 2048, groups: 1}
-    grouped_8x4096:    {m: 4096, n: 4096, k: 4096, groups: 8}
+  description: D = A . B^T with fp8 e4m3 inputs, fp32 scales per 1x128 (A) and 128x128 (B) block, bf16 output (sm90_fp8_gemm_1d2d_impl); a cluster of 2 shares the A tile (cluster_n = 2) or the B tile (cluster_m = 2) via TMA multicast
+  shapes:   # tests/generators.py: enumerate_normal (m = 4096, bf16-output n,k) and enumerate_m_grouped_contiguous (8 groups x 4096, n = k = 4096)
+    m4096_n4096_k7168:  {m: 4096, n: 4096,  k: 7168, groups: 1}
+    m4096_n7168_k2048:  {m: 4096, n: 7168,  k: 2048, groups: 1}
+    m4096_n2112_k7168:  {m: 4096, n: 2112,  k: 7168, groups: 1}
+    m4096_n24576_k1536: {m: 4096, n: 24576, k: 1536, groups: 1}
+    grouped_8x4096:     {m: 4096, n: 4096,  k: 4096, groups: 8}   # m per group; A is (8*4096) x 4096, B is 8 x 4096 x 4096
   flops: "2*groups*m*n*k"
-  min_hbm_bytes: "groups*(m*k + n*k + 2*m*n + 4*(m*k/128 + n*k/128/128))"
-  validate: {reference: "deep_gemm.testing calc_diff vs torch fp32 (tests/test_fp8_fp4.py)", tolerance: "diff < 1e-3"}
+  min_hbm_bytes: "groups*(m*k + n*k + 2*m*n + 4*(m*k/128 + n*k/128/128))"   # fp8 A, B + bf16 D + fp32 SFA (1x128) and SFB (128x128)
+  validate:
+    reference: "tests/generators.py references: dense (a.float() @ b.float().t()).bfloat16() of the unquantised bf16 inputs; grouped per-group bf16 a_g @ b_g.t(); cuBLASLt (no block scales) against the fp32 product of the same fp8 values; compared with deep_gemm.testing.calc_diff (wrapper check())"
+    tolerance: "calc_diff < 1e-3 (QuantConfig.max_diff() for fp8 x fp8, tests/test_fp8_fp4.py)"
   variants:
     - id: cluster1
       role: non_dsmem
-      description: same JIT kernel with kNumTMAMulticast = 1, forced with patches/deepgemm__force_cluster_1.patch (env DG_FORCE_CLUSTER_1=1)
-      build: {cwd: third_party/DeepGEMM, cmd: "git submodule update --init --recursive && git apply ../../roofline/patches/deepgemm__force_cluster_1.patch && ./develop.sh", patch: patches/deepgemm__force_cluster_1.patch}
-      run:   {cwd: third_party/DeepGEMM, cmd: "DG_FORCE_CLUSTER_1=1 DG_PRINT_CONFIGS=1 DG_USE_NVIDIA_TOOLS=1 python tests/test_fp8_fp4.py  # restricted to {shape}"}
+      description: same JIT kernel sm90_fp8_gemm_1d2d_impl with kNumTMAMulticast = 1 (cluster_m = cluster_n = 1), forced by patches/deepgemm__force_cluster_1.patch + DG_FORCE_CLUSTER_1=1; block sizes and stages identical to cluster2 at every shape (static heuristic replay)
+      build:
+        cwd: third_party/DeepGEMM
+        patch: patches/deepgemm__force_cluster_1.patch
+        cmd: "set -e; for d in cutlass deep_jit; do if [ -d third-party/$d ] && [ ! -L third-party/$d ]; then rmdir third-party/$d; fi; ln -sfn {repo}/third_party/DeepGEMM/third-party/$d third-party/$d; done; ln -sfn $PWD/third-party/cutlass/include/cutlass deep_gemm/include/cutlass; ln -sfn $PWD/third-party/cutlass/include/cute deep_gemm/include/cute; rm -rf build dist *.egg-info; python3 setup.py build; so=$(find build -name '_C*.so' -type f | head -n 1); test -n \"$so\"; ln -sfn ../$so deep_gemm/; python3 -c 'import glob, sys; sys.exit(0 if glob.glob(\"deep_gemm/_C*.so\") else 1)'"
+      run:
+        cmd: "python3 {harness}/workloads/deepgemm_fp8_gemm_multicast.py --variant cluster1 --warmup {warmup} --iters {iters} --m {m} --n {n} --k {k} --groups {groups}"
+        pythonpath: ["{worktree}"]
+        env: {DG_FORCE_CLUSTER_1: "1", DG_USE_NVIDIA_TOOLS: "1"}
+      validate:
+        cmd: "python3 {harness}/workloads/deepgemm_fp8_gemm_multicast.py --variant cluster1 --validate --m {m} --n {n} --k {k} --groups {groups}"
+        pythonpath: ["{worktree}"]
+        env: {DG_FORCE_CLUSTER_1: "1", DG_USE_NVIDIA_TOOLS: "1", DG_PRINT_CONFIGS: "1"}
+        expect: ["^VALIDATION PASS$", "cluster_m=1, cluster_n=1\\)", "num_sms_per_cluster=1,"]
       kernels: ["sm90_fp8_gemm_1d2d_impl"]
       cluster_size: 1
     - id: cluster2
       role: dsmem
-      description: heuristic-chosen cluster 2 with SM90_TMA_LOAD_MULTICAST of A or B and pairwise remote empty-barrier arrives
-      build: {cwd: third_party/DeepGEMM, cmd: "git submodule update --init --recursive && ./develop.sh"}
-      run:   {cwd: third_party/DeepGEMM, cmd: "DG_PRINT_CONFIGS=1 DG_USE_NVIDIA_TOOLS=1 python tests/test_fp8_fp4.py  # restricted to {shape}; confirm cluster_m/cluster_n == 2 in the printed config"}
+      description: shipped heuristic (sm90.hpp) picks cluster 2 at every listed shape (> 1 wave on 132 SMs) - cluster_n = 2 multicasts A (dense n4096/n7168/n24576), cluster_m = 2 multicasts B (n2112, grouped); empty barriers released by remote arrives from the peer CTA
+      build:
+        cwd: third_party/DeepGEMM
+        cmd: "set -e; for d in cutlass deep_jit; do if [ -d third-party/$d ] && [ ! -L third-party/$d ]; then rmdir third-party/$d; fi; ln -sfn {repo}/third_party/DeepGEMM/third-party/$d third-party/$d; done; ln -sfn $PWD/third-party/cutlass/include/cutlass deep_gemm/include/cutlass; ln -sfn $PWD/third-party/cutlass/include/cute deep_gemm/include/cute; rm -rf build dist *.egg-info; python3 setup.py build; so=$(find build -name '_C*.so' -type f | head -n 1); test -n \"$so\"; ln -sfn ../$so deep_gemm/; python3 -c 'import glob, sys; sys.exit(0 if glob.glob(\"deep_gemm/_C*.so\") else 1)'"
+      run:
+        cmd: "python3 {harness}/workloads/deepgemm_fp8_gemm_multicast.py --variant cluster2 --warmup {warmup} --iters {iters} --m {m} --n {n} --k {k} --groups {groups}"
+        pythonpath: ["{worktree}"]
+        env: {DG_USE_NVIDIA_TOOLS: "1"}
+      validate:
+        cmd: "python3 {harness}/workloads/deepgemm_fp8_gemm_multicast.py --variant cluster2 --validate --m {m} --n {n} --k {k} --groups {groups}"
+        pythonpath: ["{worktree}"]
+        env: {DG_USE_NVIDIA_TOOLS: "1", DG_PRINT_CONFIGS: "1"}
+        expect: ["^VALIDATION PASS$", "cluster_m=(1, cluster_n=2|2, cluster_n=1)\\)", "num_sms_per_cluster=2,"]
       kernels: ["sm90_fp8_gemm_1d2d_impl"]
       cluster_size: 2
     - id: cublaslt
-      role: control
-      description: cuBLASLt FP8 (deep_gemm.cublaslt_gemm_nt), reference throughput
-      build: {cwd: third_party/DeepGEMM, cmd: "./develop.sh"}
-      run:   {cwd: third_party/DeepGEMM, cmd: "python -c 'deep_gemm.cublaslt_gemm_nt(...)' # agent script"}
-      kernels: ["cublasLt|gemm"]
+      role: reference
+      description: cuBLASLt FP8 e4m3 GEMM via deep_gemm.cublaslt_gemm_nt (what tests/test_fp8_fp4.py compares against) - per-tensor, no block scales, bf16 out; grouped shape = one call per group; attainable-throughput marker, not in the non_dsmem -> dsmem arrow (cuBLASLt may itself use clusters)
+      build:
+        cwd: third_party/DeepGEMM
+        cmd: "set -e; for d in cutlass deep_jit; do if [ -d third-party/$d ] && [ ! -L third-party/$d ]; then rmdir third-party/$d; fi; ln -sfn {repo}/third_party/DeepGEMM/third-party/$d third-party/$d; done; ln -sfn $PWD/third-party/cutlass/include/cutlass deep_gemm/include/cutlass; ln -sfn $PWD/third-party/cutlass/include/cute deep_gemm/include/cute; rm -rf build dist *.egg-info; python3 setup.py build; so=$(find build -name '_C*.so' -type f | head -n 1); test -n \"$so\"; ln -sfn ../$so deep_gemm/; python3 -c 'import glob, sys; sys.exit(0 if glob.glob(\"deep_gemm/_C*.so\") else 1)'"
+      run:
+        cmd: "python3 {harness}/workloads/deepgemm_fp8_gemm_multicast.py --variant cublaslt --warmup {warmup} --iters {iters} --m {m} --n {n} --k {k} --groups {groups}"
+        pythonpath: ["{worktree}"]
+        env: {DG_USE_NVIDIA_TOOLS: "1"}
+      validate:
+        cmd: "python3 {harness}/workloads/deepgemm_fp8_gemm_multicast.py --variant cublaslt --validate --m {m} --n {n} --k {k} --groups {groups}"
+        expect: ["^VALIDATION PASS$"]
+      kernels: ["nvjet"]   # cuBLASLt SM90 kernels; "gemm" also matched the setup kernel deep_gemm::transpose_fp32
       cluster_size: null
 scope_layer: null
-measure: {reps: 30, warmup: 10, flush_l2: true}
+measure: {reps: 100, warmup: 20, flush_l2: true}
 notes: >
-  No env var controls the cluster size upstream; the patch adds one. The heuristic only uses cluster 2 when
-  the grid has more than one wave (M=1/128 shapes already run at cluster 1), so check DG_PRINT_CONFIGS.
-  bench_kineto flushes L2 with a 256 MB buffer. Needs CUDA >= 12.9 and C++20.
+  Build (no pip install, no develop.sh): the runner's worktrees roofline/build/src/DeepGEMM__pin (cluster2, cublaslt) and
+  DeepGEMM__deepgemm__force_cluster_1 (cluster1); a git worktree does not check out submodules, so build.cmd replaces
+  the empty third-party/{cutlass,deep_jit} directories by symlinks to the initialised submodules of third_party/DeepGEMM
+  (cutlass v4.2.1, deep_jit 2efdab4; third_party/ is not modified), then does what develop.sh does in-tree: cutlass/cute
+  include links in deep_gemm/include (needed by the JIT at run time), `python3 setup.py build` (one host .cpp, g++ 13
+  -std=c++20; no device code, no GPU needed) and a symlink of build/lib*/deep_gemm/_C*.so into deep_gemm/. The package is
+  imported from the worktree (run.pythonpath). setup.py reports the version as 2.8.2+local (dirty tree: symlinks / patch).
+  Kernels are JIT-compiled with nvcc --cubin at the first call (cache DG_JIT_CACHE_DIR = roofline/build/cache/deepgemm, set
+  by roofline/tools/run, shared by both worktrees: the cache key hashes the generated source, whose template arguments
+  carry the cluster size and multicast side, plus the content of the deep_gemm/ headers, identical in both worktrees; the
+  patch touches only the host heuristic). Validation compiles the kernel; the warm-up iterations of later runs hit the cache.
+  The heuristic only uses cluster 2 when the grid has more than one wave; static replay of sm90.hpp for 132 SMs gives
+  cluster 2 at all five shapes (no skip): n4096_k7168 256x128 c(1,2) 4 waves; n7168_k2048 256x128 c(1,2) 7 waves;
+  n2112_k7168 128x192 c(2,1) 3 waves; n24576_k1536 256x128 c(1,2) 24 waves; grouped 128x192 c(2,1) 43 waves; cluster1
+  picks the same block sizes (modelled cycles 27-37 % higher). Validation runs with DG_PRINT_CONFIGS=1 and checks the
+  printed Layout; timing/ncu runs do not print (DG_PRINT_CONFIGS also prints every TMA descriptor per call).
+  The wrapper (roofline/harness/workloads/deepgemm_fp8_gemm_multicast.py) quantises inputs with tests/generators.py's
+  cast helpers (A per-token 1x128, B per-block 128x128, ue8m0 off as on SM90) and pre-transforms SFA to the MN-major
+  TMA-aligned layout once, so a call launches only the GEMM kernel (fp8_gemm_nt would otherwise run DeepGEMM's
+  transpose_fp32 kernel on SFA every call; upstream's bench_kineto excludes it from its timing as well). Grouped: fixed
+  4096 rows per group (tests draw 0.7-1.3 x 4096 at random), contiguous layout with m_indices, alignment 128. A call
+  does not synchronise; it encodes the TMA descriptors on the host each call. DG_USE_NVIDIA_TOOLS only disables
+  upstream's bench_kineto (not used here). min_hbm_bytes ignores the m_indices reads (one int per 128-row block) and
+  includes scales the cuBLASLt reference does not read (~3 % of A at k-blocks of 128). Role `reference` (cuBLASLt) is not
+  one of DESIGN 2.3's roles: the notebook must leave it out of the arrow chain (same as dak_gemm_multicast's cublas).

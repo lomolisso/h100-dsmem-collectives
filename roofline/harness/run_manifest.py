@@ -79,6 +79,7 @@ METRICS = [
     "sm__sass_thread_inst_executed_op_hfma_pred_on.sum", "sm__sass_thread_inst_executed_op_hadd_pred_on.sum",
     "sm__sass_thread_inst_executed_op_hmul_pred_on.sum",
     "sm__sass_thread_inst_executed_op_integer_pred_on.sum",
+    "sm__sass_thread_inst_executed_op_bit_pred_on.sum", "sm__sass_thread_inst_executed_op_conversion_pred_on.sum",
     "sm__inst_executed_pipe_tensor_op_hmma.sum", "sm__inst_executed_pipe_tensor_op_gmma.sum",
     "sm__cycles_elapsed.avg", "launch__grid_size", "launch__cluster_dim_x", "launch__block_size",
 ]

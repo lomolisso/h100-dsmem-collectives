@@ -138,6 +138,8 @@ workload,variant_id,role,scope,shape_id,rep,time_ns,wall_ns,flops,int_ops,hbm_by
   driver stubs, `TORCH_CUDA_ARCH_LIST=9.0a`. JIT caches (`TORCH_EXTENSIONS_DIR`, `TORCHINDUCTOR_CACHE_DIR`,
   `TRITON_CACHE_DIR`, `DG_JIT_CACHE_DIR`, `FLASHINFER_WORKSPACE_BASE`, `XDG_CACHE_HOME`) under
   `roofline/build/cache/`, set by `roofline/tools/run`. Not installed: conda, CUDA 13, fairscale, FA4 dependencies.
+- Image revision (R5): `h100-roofline:cuda12.9.1-83734cedf58e` = R0 image + `libdw-dev`/`libelf-dev`
+  0.190-1.1ubuntu0.1 (DeepGEMM's deep_jit includes elfutils headers; the runtime library was already present).
 - Versions (R0 smoke on GPU 3): driver 580.126.20, CUDA 12.9.1 / nvcc 12.9.86, Nsight Compute 2025.2.1.0,
   Python 3.12.3, PyTorch 2.11.0+cu129 (cuDNN 9.17.1), Triton 3.6.0, flashinfer-python 0.7.2.post1 (JIT kernels).
 - Clock state: SM clock locked by `tools/run --profile --lock-sm-mhz <LOCK>` on GPU 3 (value from
@@ -159,4 +161,7 @@ workload,variant_id,role,scope,shape_id,rep,time_ns,wall_ns,flops,int_ops,hbm_by
   per-(submodule, patch) worktree): CREDIT `make all CUDA_ARCH=sm_90a -j8` (+ `patches/credit__roofline_hooks.patch`, R2);
   DAK `export NVCC_APPEND_FLAGS="-I$CUTLASS_INCLUDE" && make runtime.o .build_tile_n arch=90a TILE_N=8 && DAK_ARCH=90a
   DAK_TILE_N=8 MAX_JOBS=8 python3 setup.py build_ext --inplace` (no `setup.sh`/conda; CUTLASS 4.4.2 from the image; R3);
-  _others: R4–R7_
+  DeepGEMM: symlink `third-party/{cutlass,deep_jit}` from the submodule into the worktree, link
+  `deep_gemm/include/{cutlass,cute}`, `python3 setup.py build`, symlink `_C*.so` into `deep_gemm/` (develop.sh without the
+  submodule update; R5); JIT cache `roofline/build/cache/deepgemm` (shared: the cache key includes the cluster size);
+  _others: R4, R6, R7_

@@ -2,7 +2,7 @@
 # dependencies of the artifacts in third_party/. Build with `roofline/tools/build_image.sh build`; never
 # `docker run` it directly — use `roofline/tools/run`, which goes through the microbench tools/run
 # (GPU preflight, lock, clock lock, device restriction).
-ARG BASE_IMAGE
+ARG BASE_IMAGE=h100-microbench:cuda12.9.1-26d4f436f8c5
 FROM ${BASE_IMAGE}
 
 # Packages on top of the microbench venv, fully pinned (see requirements.txt for the intent).
@@ -21,3 +21,8 @@ RUN { echo "# roofline additions"; /opt/venv/bin/pip freeze; } >> /opt/env-manif
 ENV CUTLASS_INCLUDE=/opt/cutlass/include \
     LIBRARY_PATH=/usr/local/cuda/lib64/stubs \
     TORCH_CUDA_ARCH_LIST=9.0a
+
+# DeepGEMM (deep_jit) includes elfutils headers for stack traces; libdw1t64 is already in the base image, only the
+# headers are added (R5). Same Ubuntu release versions as the installed runtime library.
+RUN apt-get update && apt-get install -y --no-install-recommends libdw-dev=0.190-1.1ubuntu0.1 libelf-dev=0.190-1.1ubuntu0.1 \
+    && rm -rf /var/lib/apt/lists/*
