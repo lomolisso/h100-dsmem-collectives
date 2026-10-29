@@ -206,7 +206,7 @@ def do_build(cs, args, run_id):
             print(f"[build] up to date: {os.path.basename(wt)}: {cmd}")
             continue
         if v["build"].get("gpu") and not os.environ.get("H100MB_GPU_UUID"):
-            sys.exit(f"[build] {v['id']}: build.gpu is set, run this stage with a GPU (tools/run without --no-gpu)")
+            sys.exit(f"[build] {v['id']}: build.gpu is set, run this stage with a GPU (h100 run without --no-gpu)")
         print(f"[build] {os.path.basename(wt)}: {cmd}")
         if args.dry_run:
             continue

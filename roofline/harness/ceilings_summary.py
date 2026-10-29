@@ -164,7 +164,7 @@ class Summary:
         self.rows.append([name, value, unit, method, source, p10, p90, n, flagged, rids])
 
     def lock_note(self, rids):
-        """Lock requested by tools/run, from the clock-log rows of the source runs."""
+        """Lock requested by h100 run, from the clock-log rows of the source runs."""
         try:
             cl = pd.read_csv(f"{RES}/roofline__clock_log.csv", usecols=["run_id", "lock_sm_mhz"])
             v = cl[cl.run_id.isin(rids)].lock_sm_mhz

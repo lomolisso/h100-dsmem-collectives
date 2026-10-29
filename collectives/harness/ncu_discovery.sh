@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ncu_discovery.sh — C1 step 8: which DSMEM metrics exist on this device and which byte metric carries the payload
 # of a push (bulk copy / plain remote store) and of a pull (remote loads). Run from the repo root inside
-#   tools/run --profile --lock-sm-mhz <LOCK> -- bash collectives/harness/ncu_discovery.sh
+#   h100 run --profile --lock-sm-mhz <LOCK> -- bash collectives/harness/ncu_discovery.sh
 # 1. ncu --query-metrics → results/ncu_query_metrics.txt (full list) and the dshared|cluster|cgas subset on stdout.
 # 2. Candidate metrics of docs/EXPERIMENTS.md §1 (+ lts__t_sectors_srcunit_tex.sum, launch__cluster_*) filtered
 #    through that list (the available() pattern of h100-microbench 05/run.sh), then one profiled launch per

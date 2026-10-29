@@ -60,11 +60,12 @@ Conventions the runner (`roofline/harness/run_manifest.py`, written in R2; its d
   `step` runs exactly one iteration of the variant (only its kernels plus what the region needs), `check`
   compares against the reference of `validate`.
 - Everything runs through `roofline/tools/run` (`../../docs/ENVIRONMENT.md`): `--no-gpu` for `--stage build`,
-  `--profile --lock-sm-mhz 1635` for validate / time / ncu.
+  `--gpu 3 --profile --lock-sm-mhz 1635` for validate / time / ncu.
 
 Checklist before a manifest is "done":
-0. Any new Python or system dependency is added to `roofline/docker/Dockerfile` (+ its lock file), the
-   image is rebuilt and re-tagged with `roofline/tools/build_image.sh`, and `docs/DESIGN.md` §6 lists it.
+0. Any new Python or system dependency is added to the shared image (`~/h100/docker/requirements.txt` →
+   `h100 image lock` → `h100 image build`, or the Dockerfile), with the user's approval, and `docs/DESIGN.md` §6
+   lists it.
 1. Both `build` commands succeed from a fresh checkout (plus the referenced patch).
 2. The `run` command for every variant produces the output the `validate.reference` can check, and
    validation passes at the stated tolerance.

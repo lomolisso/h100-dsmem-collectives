@@ -2,9 +2,9 @@
 
 @ROADMAP.md
 
-> **IMPORTANT — READ FIRST.** The server protocol is known and binding: `../docs/ENVIRONMENT.md` (summary of
-> `h100-microbench/docs/environment/README.md`). Every build, run and notebook goes through
-> `~/work/fa2026/iacoma/h100-microbench/tools/run`, on **GPU 3**, with the locked SM clock for every timed or
+> **IMPORTANT — READ FIRST.** The server protocol is known and binding: `~/h100/H100.md` and
+> `../docs/ENVIRONMENT.md`. Every build, run and notebook goes through `h100 run` (GPU runs queued, pinned to
+> **GPU 3** with `--gpu 3` so the series stays on one card), with the locked SM clock for every timed or
 > ncu run. Do not invent another protocol; if something on the server contradicts that file, stop, tell the
 > user, and record the finding there.
 
@@ -25,11 +25,14 @@ Follow `../CLAUDE.md` ("Starting a new conversation"): the task is the first row
 ## H100 NVL server protocol (binding; details in `../docs/ENVIRONMENT.md`)
 
 - Access: edit, run agents and use git directly in this NFS checkout on `nishil-4xh100-01`; the GPUs are
-  shared with other users, ours are GPU 3 (default) and GPU 2 (only when the user names it).
-- Checking and reserving the GPU: `tools/run` runs the preflight (no foreign process, ≤ 1 GiB used, ≤ 5 %
-  utilisation, no other container given the GPU) and holds the cooperative lock
-  `/tmp/h100-gpu-locks/gpu3.lock` for the lifetime of its container. The lock is shared with h100-microbench:
-  one GPU job at a time; if it is held, wait and retry. Status: `make -C ~/work/fa2026/iacoma/h100-microbench gpu-status`.
+  shared with other users, ours are GPU 2 and GPU 3. The target GPU is set by the user (`h100-target`); this
+  study's GPU runs are pinned to GPU 3 (`h100 run --gpu 3 …`), where C1 onwards ran.
+- Checking and reserving the GPU: GPU jobs enter the user's FCFS queue. Its dispatcher runs the preflight (no
+  foreign process, ≤ 1 GiB used, ≤ 5 % utilisation, no other container given the GPU) and holds the
+  cooperative lock `/tmp/h100-gpu-locks/gpu<N>.lock` for the lifetime of the job's container; one GPU job at a
+  time across this repository and h100-microbench. If anyone else uses the GPU, or a running job is ended from
+  outside, the queue **freezes** (the interrupted job stays at the head and reruns after the user unfreezes):
+  report `h100 queue`'s reason and wait. Status: `h100 status`.
 - Limits: `--profile` is required for ncu counters (`RmProfilingAdminOnly=1`) and for the clock lock
   (`--lock-sm-mhz <LOCK>`, value from h100-microbench `docs/context/10` for GPU 3; GPU measurements wait
   until its GPU-3 bring-up row is `done`). Containers need ≥ 2 GB free scratch. No run-time limit is
@@ -37,21 +40,22 @@ Follow `../CLAUDE.md` ("Starting a new conversation"): the task is the first row
   interrupted run never has to start over.
 - Where to build and write: in-tree on NFS (`collectives/build/`, `collectives/results/`, both git-ignored);
   never the container's `/tmp`.
-- Clean-up: none beyond `tools/run`'s own (`--rm` containers, lock released on exit). Never `docker run` by
+- Clean-up: none beyond the queue's own (containers removed after each job, lock released). Never `docker run` by
   hand, never prune, never touch other users' processes, containers or locks. Never delete results.
 
 ## Tooling (fill the run-time values when they are first used)
 
-- Image: `h100-microbench:cuda12.9.1-26d4f436f8c5` (`tools/env info`, 2026-10-25): CUDA 12.9.1, nvcc 12.9.86
+- Image: since 2026-10-29 the shared `h100:cuda12.9.1-<hash>` (`h100 image info`; same CUDA/ncu/nsys versions,
+  plus PyTorch, clang-20, NVBit, CUTLASS). C1 ran in `h100-microbench:cuda12.9.1-26d4f436f8c5` (2026-10-25): CUDA 12.9.1, nvcc 12.9.86
   (`Build cuda_12.9.r12.9/compiler.36037853_0`), Nsight Compute 2025.2.1.0 (build 35987062), Nsight Systems
   2025.1.3.140, compute-sanitizer, cuda-gdb, Python 3.12.3 (numpy 2.5.4, pandas 3.1.0, matplotlib, scipy, jupyter).
-  `tools/env verify --gpu 3 --profile` (2026-10-25): toolchain ok; GPU probe ok (1 visible device, driver API 13000,
+  `h100 image verify --gpu 3 --profile` (2026-10-25): toolchain ok; GPU probe ok (1 visible device, driver API 13000,
   runtime 12090, H100 NVL cc 9.0, 132 SMs, 60 MiB L2, 227 KiB opt-in smem/block, PCI da:00); one-metric ncu probe ok.
 - Driver 580.126.20 (CUDA 13.0 driver API); GPU 3 = `GPU-1241dcbc-33ea-80bf-5f87-37f7868c3126`, serial
   1793225008254. SM clock lock **1635 MHz** (confirmed for GPU 3 by the microbench GPU-3 bring-up, commit `89ff996`).
   Repo commit at C1 start: `bb9fa9c`. Vendored harness: `common/h100mb/` from microbench `14875a5`
   (`common/h100mb/PROVENANCE.md`).
-- Exact build and run commands (C1; run from the repo root, `TR=~/work/fa2026/iacoma/h100-microbench/tools/run`):
+- Exact build and run commands (C1; run from the repo root, `TR="h100 run"`; GPU commands pinned with `--gpu 3`):
   - build matrix: `$TR --no-gpu -- python3 collectives/harness/driver.py build --jobs 16` (per configuration the
     TESTING §1 command plus `-DCOLL_NAME='"<file>"' -DCOLL_OP=<0..3>`; writes `results/build_matrix_v2.csv`, grid +
     `M_max` points; see the driver docstring);
@@ -123,7 +127,7 @@ Follow `../CLAUDE.md` ("Starting a new conversation"): the task is the first row
 - Use `%globaltimer`-based latency from the kernel's own stamps for the figures; host-side
   `cudaEvent` time includes launch overhead (≈ 4 µs event floor, 7–8 µs launch on this host) and is
   reported separately.
-- Clocks: every timed or ncu run uses `tools/run --profile --lock-sm-mhz <LOCK>`; ncu always with
+- Clocks: every timed or ncu run uses `h100 run --profile --lock-sm-mhz <LOCK>`; ncu always with
   `--clock-control none` (never `base`: it would override our lock). Record clocks and throttle reasons per
   configuration (`hb::Run::clock_note`) and discard launches that ran below the lock (count them).
 - CSVs: mandatory columns first, append-only, flushed per launch, runs registered in

@@ -3,7 +3,7 @@
 Roadmap tasks C1 (harness, build matrix), C2–C3 (correctness, §2–3) and C4 (§4–6, after the sweep C5 and the notebook C6) implement this design
 under `collectives/harness/` (`ROADMAP.md`). Nothing here depends on the server; the server protocol is
 `../../docs/ENVIRONMENT.md`, tool versions are recorded in `CLAUDE.md` → *Tooling*. Builds run through
-`tools/run --no-gpu`, GPU runs through `tools/run --profile --lock-sm-mhz <LOCK>` on GPU 3; the vendored
+`h100 run --no-gpu`, GPU runs through `h100 run --profile --lock-sm-mhz <LOCK>` on GPU 3; the vendored
 microbench harness (`../../common/h100mb/`, `../../docs/REUSE.md`) provides the CSV writer, run registry,
 device checks and clock notes.
 
@@ -16,7 +16,7 @@ nvcc -arch=sm_90a -std=c++17 -O3 -lineinfo -Xptxas -v -I ../common/h100mb \
      -DCOLLECTIVE_FILE='"../<file>.cu"' -DCLUSTER_N=<N> -DMSG_ELEMS=<M> -DELEM_T=<T> \
      -o build/<file>__N<N>_M<M>_<T> harness/main.cu -L$CUDA_HOME/lib64/stubs -lcuda -lnvidia-ml
 ```
-(run from `collectives/` inside `tools/run --no-gpu`; `-lnvidia-ml` is needed by the vendored `host.hpp`).
+(run from `collectives/` inside `h100 run --no-gpu`; `-lnvidia-ml` is needed by the vendored `host.hpp`).
 
 | Axis | Values |
 |---|---|

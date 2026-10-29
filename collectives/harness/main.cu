@@ -48,7 +48,7 @@
  *   --mode ncu  R launches (default 1) for Nsight Compute; results printed, no result CSV (registry only).
  *       --baseline launches an empty kernel with the same grid, block and cluster instead (ncu baseline).
  * clock_bad = hb::ClockSample::bad() of the NVML sample taken right after the launch (throttle reason or SM clock
- * below the tools/run lock). Clock notes at the start and end of the configuration go to
+ * below the h100 run lock). Clock notes at the start and end of the configuration go to
  * results/collectives__clock_log.csv; the run is registered in results/collectives__runs.csv (started/complete).
  * Run from collectives/ (hb::Run writes ./results/).
  */

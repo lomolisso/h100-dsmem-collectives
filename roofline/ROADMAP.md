@@ -35,9 +35,11 @@ R3–R7 depend only on R2 (the runner) and could run in any order; the order abo
 `../collectives/` (the DSMEM ceiling is measured in R1).
 
 ## Shared facts for every task
-- Commands: after R0, `TR=roofline/tools/run` (from the repo root) wraps
-  `~/work/fa2026/iacoma/h100-microbench/tools/run` with the roofline image. Builds `$TR --no-gpu -- …`; GPU
-  runs `$TR --profile --lock-sm-mhz <LOCK> -- …` on GPU 3 (`<LOCK>`: h100-microbench `docs/context/10` §2).
+- Commands: `TR=roofline/tools/run` (from the repo root) wraps `h100 run` (`~/h100/H100.md`) with the study's
+  cache and `PYTHONPATH` variables; since 2026-10-29 every study uses the one shared image `h100:cuda12.9.1-<hash>`
+  (the roofline image of R0/R5 below is retired). Builds `$TR --no-gpu -- …`; GPU runs
+  `$TR --gpu 3 --profile --lock-sm-mhz <LOCK> -- …` (queued, pinned to GPU 3; `<LOCK>`: h100-microbench
+  `docs/context/10` §2).
 - Layout: `roofline/harness/` (runner, ceiling kernels, wrappers), `roofline/build/` (git-ignored: per-variant
   source worktrees `build/src/<manifest>__<variant>/`, built extensions, `build/pyenv/`, JIT caches
   `build/cache/`), `roofline/results/` (git-ignored except the files `CLAUDE.md` names).

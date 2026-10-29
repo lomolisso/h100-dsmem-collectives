@@ -9,7 +9,7 @@ ncu rules: `../../docs/ENVIRONMENT.md`.
 
 - Toolchain: h100-microbench image, CUDA 12.9.1 (nvcc 12.9.86), Nsight Compute 2025.2.1; driver and image
   tag: see `CLAUDE.md` → *Tooling* (C1).
-- Clock state: SM clock locked by `tools/run --profile --lock-sm-mhz <LOCK>` (GPU 3; value from
+- Clock state: SM clock locked by `h100 run --profile --lock-sm-mhz <LOCK>` (GPU 3; value from
   h100-microbench `docs/context/10` §2), memory clock 2619 MHz never changed; the harness logs clocks and
   throttle reasons per configuration (`results/collectives__clock_log.csv`). Value used: **1635 MHz** (GPU 3,
   C5: 0 of 246 000 timed launches clock-flagged)
@@ -82,7 +82,7 @@ Report per configuration: median over reps of `L`, `algbw`, `busbw`; p10/p90 of 
 Procedure per configuration: build (TESTING.md command), run the harness in "perf" mode which writes one
 row per (rep, rank, stamp) — no correctness check in the timed loop but a final check after it.
 Randomise the order of configurations across the sweep and repeat the full sweep twice to detect drift.
-Clocks: the SM clock is locked for every timed and ncu run (`tools/run --profile --lock-sm-mhz <LOCK>`);
+Clocks: the SM clock is locked for every timed and ncu run (`h100 run --profile --lock-sm-mhz <LOCK>`);
 the memory clock is left at its default. Launches whose clock sample is below the lock or whose throttle
 reasons fired are discarded and counted (`hb::ClockSample::bad()`); state the clock situation in the notebook.
 
@@ -91,7 +91,7 @@ reasons fired are discarded and counted (`hb::ClockSample::bad()`); state the cl
 1. Discover the metrics once: `ncu --query-metrics | grep -i -E "cluster|dsmem|distributed|shared"` and
    `ncu --list-sections | grep -i memory`; the *Memory Workload Analysis* tables contain a
    "Distributed Shared Memory" row on Hopper. Record the exact metric names in §1.
-2. Per configuration (reps = 5, kernel replay), inside `tools/run --profile --lock-sm-mhz <LOCK>`:
+2. Per configuration (reps = 5, kernel replay), inside `h100 run --profile --lock-sm-mhz <LOCK>`:
    `ncu --clock-control none --cache-control all --launch-skip 20 --launch-count 5 --section MemoryWorkloadAnalysis_Tables --metrics <dsmem metrics>,sm__cycles_elapsed.avg,smsp__cycles_active.avg,sm__ctas_launched.sum,lts__t_sectors_srcunit_tex.sum --csv --page raw --print-units base ./build/<cfg> > results/ncu_<cfg>.csv`
    (never `--clock-control base`, which would override the lock; never `--print-metric-name name`, which
    ncu 2025.2.1 rejects with `--page raw`). Filter the metric list through `ncu --query-metrics` first.

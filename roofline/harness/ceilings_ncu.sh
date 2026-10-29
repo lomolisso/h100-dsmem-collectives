@@ -7,7 +7,7 @@
 #
 # Template: MB/experiments/05__memory_hierarchy_bandwidth/src/run.sh (available() filter against ncu --query-metrics,
 # ncu -o + ncu -i --csv --page raw --print-units base, join to a launch manifest written by the profiled program).
-# Flags (DESIGN §3 / docs/REUSE.md §4): --clock-control none (keeps the tools/run lock), --cache-control all, kernel
+# Flags (DESIGN §3 / docs/REUSE.md §4): --clock-control none (keeps the h100 run lock), --cache-control all, kernel
 # replay; never --print-metric-name. One report per profiled program, named with a time stamp (never overwritten).
 #   compute   bin/compute_peak ncu   -k regex:_peak     sm__sass_thread_inst_executed_op_ffma_pred_on.sum (FFMA count of
 #             ffma_peak; expected = manifest inst_total + 1 set-up FFMA per thread), integer / pipe counters for imad_peak

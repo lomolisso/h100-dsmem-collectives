@@ -1,5 +1,5 @@
 # roofline R1 ceiling microbenchmarks. Build (from the repo root, no GPU):
-#   ~/work/fa2026/iacoma/h100-microbench/tools/run --no-gpu -- make -C roofline/harness/ceilings
+#   h100 run --no-gpu -- make -C roofline/harness/ceilings
 #   (or roofline/tools/run --no-gpu -- make -C roofline/harness/ceilings)
 # → bin/<name> for every src/<name>.cu, and results/sass/<name>.sass (cuobjdump -sass, `make sass`); both git-ignored
 #   (.gitignore here). Rules, flags (-arch=sm_90a -O3 -lineinfo -std=c++17 -Xptxas -v -Xptxas -warn-spills) and the

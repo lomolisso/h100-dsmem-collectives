@@ -1,26 +1,24 @@
 #!/usr/bin/env bash
-# The h100-microbench tools/run with the roofline image (same options, preflight, lock and clock handling).
+# `h100 run` (~/h100/H100.md) with the roofline study's environment: same options, queue, preflight, lock and
+# clock handling, the shared image.
 #
-#   roofline/tools/run [tools/run options] [--] [command ...]
+#   roofline/tools/run [h100 run options] [--] [command ...]
 #     e.g. roofline/tools/run --no-gpu -- make -C build/src/x
-#          roofline/tools/run --profile --lock-sm-mhz 1635 -- python3 roofline/harness/run_manifest.py ...
+#          roofline/tools/run --gpu 3 --profile --lock-sm-mhz 1635 -- python3 roofline/harness/run_manifest.py ...
 #
-# tools/run passes only HOME, USER and its own H100MB_* variables into the container, so the command is
-# prefixed with `env` for the variables the roofline study needs: JIT caches on NFS (roofline/build/cache),
-# PYTHONPATH = roofline/harness plus $ROOFLINE_PYTHONPATH from the caller (the runner sets it per variant).
+# The container receives only HOME, USER and the h100 variables, so the command is prefixed with `env` for the
+# variables the roofline study needs: JIT caches on NFS (roofline/build/cache), PYTHONPATH = roofline/harness plus
+# $ROOFLINE_PYTHONPATH from the caller (the runner sets it per variant).
 set -euo pipefail
-MB=$HOME/work/fa2026/iacoma/h100-microbench
 REPO=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)
-IMAGE=$("$REPO/roofline/tools/build_image.sh" tag)
-docker image inspect "$IMAGE" >/dev/null 2>&1 || {
-    echo "ERROR: roofline image $IMAGE not built — run: roofline/tools/build_image.sh build" >&2; exit 1; }
+H100=${H100_HOME:-$HOME/h100}/bin/h100
 
 opts=()
 while [[ $# -gt 0 ]]; do
     case $1 in
         --gpu|--lock-sm-mhz) opts+=("$1" "$2"); shift 2 ;;
         --no-gpu|--profile) opts+=("$1"); shift ;;
-        -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,11p' "$0"; exit 0 ;;
         --) shift; break ;;
         -*) echo "ERROR: unknown option $1" >&2; exit 1 ;;
         *) break ;;
@@ -32,7 +30,7 @@ cache=$REPO/roofline/build/cache
 mkdir -p "$cache"/{torch_extensions,inductor,triton,deepgemm,flashinfer,xdg}
 pp=$REPO/roofline/harness${ROOFLINE_PYTHONPATH:+:$ROOFLINE_PYTHONPATH}
 
-H100MB_IMAGE=$IMAGE exec "$MB/tools/run" "${opts[@]}" -- env \
+exec "$H100" run "${opts[@]}" -- env \
     PYTHONPATH="$pp" \
     ROOFLINE_REPO="$REPO" \
     TORCH_EXTENSIONS_DIR="$cache/torch_extensions" \

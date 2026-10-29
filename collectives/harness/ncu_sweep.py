@@ -2,7 +2,7 @@
 """ncu_sweep.py — C5 Nsight Compute pass over the perf set (EXPERIMENTS.md §4). Stdlib only.
 
 Run from the repo root inside
-  tools/run --profile --lock-sm-mhz <LOCK> -- python3 collectives/harness/ncu_sweep.py [--files ...] [--N ...]
+  h100 run --profile --lock-sm-mhz <LOCK> -- python3 collectives/harness/ncu_sweep.py [--files ...] [--N ...]
 
 Per configuration of `driver.runnable(..., "perf")` (float):
   ncu --clock-control none --cache-control all --kernel-name collective_kernel --launch-skip 20 --launch-count 5
@@ -10,7 +10,7 @@ Per configuration of `driver.runnable(..., "perf")` (float):
       build/<cfg> --mode ncu --reps 25
 and, per N, the same-grid all-exit baseline (`--baseline`, kernel baseline_kernel) of the configuration with the
 smallest and of the one with the largest dynamic shared memory (the profiler's own traffic, ENVIRONMENT.md §4).
---clock-control none keeps the tools/run SM-clock lock; --print-metric-name is not used (ncu 2025.2.1 rejects it
+--clock-control none keeps the h100 run SM-clock lock; --print-metric-name is not used (ncu 2025.2.1 rejects it
 with --page raw). The metric list is EXPERIMENTS.md §1's final list (C1), filtered against
 results/ncu_query_metrics.txt when present.
 

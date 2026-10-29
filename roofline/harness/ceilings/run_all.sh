@@ -34,7 +34,7 @@ for b in event_floor bw_hbm bw_l2 bw_smem dsmem_bw compute_peak tc_peak; do
     [[ -x $B/$b ]] || { echo "ERROR: $B/$b missing — build first: roofline/tools/run --no-gpu -- make -C roofline/harness/ceilings" >&2; exit 1; }
 done
 if [[ -z "${H100MB_LOCK_SM_MHZ:-}" && -z "$Q" ]]; then
-    echo "ERROR: no SM clock lock (H100MB_LOCK_SM_MHZ unset): run under tools/run --profile --lock-sm-mhz 1635" >&2
+    echo "ERROR: no SM clock lock (H100MB_LOCK_SM_MHZ unset): run under h100 run --profile --lock-sm-mhz 1635" >&2
     exit 1
 fi
 mkdir -p results/ceilings/ncu

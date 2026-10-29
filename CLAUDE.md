@@ -49,14 +49,15 @@ A new conversation needs no further prompt:
 ## Subagents and tools
 - Spawning subagents to parallelise work *within* a task is encouraged (independent files, analysis,
   figure code, documentation lookups). Every subagent uses **Claude Opus 5.5 (`model: opus`) with effort `high`**.
-- **Only one GPU job at a time**, across this repository and h100-microbench (shared lock). Subagents never
-  start GPU runs in parallel. If `tools/run` refuses because the lock is held, wait and retry; never switch
-  GPU on your own.
+- **Only one GPU job at a time.** GPU jobs go through the user's per-user FCFS queue (`h100 run` / `h100 submit`; `~/h100/H100.md`): one GPU job at a time across this repository and h100-microbench; queued jobs wait without a container. If the queue is **frozen** (someone else on the GPU, a job ended from outside), report the reason from `h100 queue` to the user and wait: never `h100 unfreeze`, `h100 freeze`, `h100-target` or `h100 cancel` other jobs on your own. Subagents may submit but never bypass the queue. Claude Code kills
+  foreground commands after 2–10 min, which cancels the job: run long jobs with `h100 submit` + `h100 wait ID`
+  in the background.
 - Web search is allowed for PTX ISA, CUDA, Nsight, PyTorch and artifact documentation.
 
 ## Non-negotiable rules
-- Environment, GPU selection and safety: `docs/environment` of h100-microbench as summarised in
-  `docs/ENVIRONMENT.md` — everything through `tools/run`, **GPU 3**, locked clock for timed and ncu runs,
+- Environment, GPU selection and safety: `~/h100/H100.md` (server, `h100` command, queue, image) and
+  `docs/ENVIRONMENT.md` (this repository) — everything through `h100 run`; the target GPU is the user's choice
+  (`h100-target`), a measurement series is pinned to one card (`h100 run --gpu N`; GPU 3 so far); locked clock for timed and ncu runs,
   never `docker run` by hand or prune, never touch other users' processes.
 - Raw data: written crash-safely into `<study>/results/`, never deleted or overwritten, never committed
   (`docs/ENVIRONMENT.md` §5).

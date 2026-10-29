@@ -17,7 +17,7 @@ change log of every fix made to an artifact.
 | `analysis/roofline.ipynb` | Reads every manifest + `results/ceilings.csv` + `results/points.csv`; draws the classic and hierarchical rooflines and per-workload bars |
 | `patches/` | `git diff` patches applied to submodules to obtain a variant (referenced by manifests) |
 | `harness/` | `run_manifest.py` (build → validate → time (nsys) → ncu → `points.csv`), ceiling microbenchmarks (`ceilings/`), per-workload wrappers (`workloads/`), ncu roofline cross-check |
-| `docker/`, `tools/` | derived image (`build_image.sh`) and the `tools/run` wrapper |
+| `tools/` | `run`: the `h100 run` wrapper with the study's cache/`PYTHONPATH` variables (the image is the shared `~/h100` one) |
 | `results/` | git-ignored measurement outputs, except `ceilings.csv` and `points.csv` |
 
 ## Adding a workload pair in three steps

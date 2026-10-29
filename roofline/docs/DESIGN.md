@@ -88,7 +88,7 @@ L ∈ {HBM, L2, L1/SMEM, DSMEM}.
 2. Per manifest, per variant, per shape: build (apply `patches/` if referenced), run the validation
    command (outputs must match the reference within the manifest's tolerance), timed run, ncu run.
    Use `ncu --cache-control all --clock-control none --metrics <list> --csv --page raw --print-units base`
-   inside `tools/run --profile --lock-sm-mhz <LOCK>` (never `--clock-control base`: it overrides the lock;
+   inside `h100 run --profile --lock-sm-mhz <LOCK>` (never `--clock-control base`: it overrides the lock;
    never `--print-metric-name name`: ncu 2025.2.1 rejects it with `--page raw`); for Python-launched
    kernels add `-k regex:<kernel names from the manifest>` and `--launch-skip/--launch-count` to
    capture exactly one iteration of each kernel of the sequence.
@@ -140,9 +140,14 @@ workload,variant_id,role,scope,shape_id,rep,time_ns,wall_ns,flops,int_ops,hbm_by
   `roofline/build/cache/`, set by `roofline/tools/run`. Not installed: conda, CUDA 13, fairscale, FA4 dependencies.
 - Image revision (R5): `h100-roofline:cuda12.9.1-83734cedf58e` = R0 image + `libdw-dev`/`libelf-dev`
   0.190-1.1ubuntu0.1 (DeepGEMM's deep_jit includes elfutils headers; the runtime library was already present).
+- Since 2026-10-29: the roofline image is retired; every study uses the shared image `h100:cuda12.9.1-<hash>`
+  (`~/h100/docker/`), which contains the R0/R5 additions with the same pins (torch 2.11.0+cu129, triton 3.6.0,
+  flashinfer 0.7.2.post1, CUTLASS v4.4.2 source at `/opt/cutlass`, `libdw-dev`/`libelf-dev`, CUDA driver stubs,
+  `TORCH_CUDA_ARCH_LIST=9.0a`) plus flash-attn 2.8.3.post2, clang-20 and NVBit. Results measured before that date
+  ran in `h100-roofline:cuda12.9.1-83734cedf58e`.
 - Versions (R0 smoke on GPU 3): driver 580.126.20, CUDA 12.9.1 / nvcc 12.9.86, Nsight Compute 2025.2.1.0,
   Python 3.12.3, PyTorch 2.11.0+cu129 (cuDNN 9.17.1), Triton 3.6.0, flashinfer-python 0.7.2.post1 (JIT kernels).
-- Clock state: SM clock locked by `tools/run --profile --lock-sm-mhz <LOCK>` on GPU 3 (value from
+- Clock state: SM clock locked by `h100 run --profile --lock-sm-mhz <LOCK>` on GPU 3 (value from
   h100-microbench `docs/context/10` §2), memory clock 2619 MHz, never changed. Value used: **1635 MHz** (R1: every ceiling launch at 1635 MHz; sustained
   8192³ tensor-core GEMMs back to back pull the clock below the lock through the 400 W limit, so `ceilings_tc.py` idles
   1 s before every timed GEMM and 10 s before every configuration).

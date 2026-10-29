@@ -2,10 +2,11 @@
 
 @ROADMAP.md
 
-> **IMPORTANT — READ FIRST.** The server protocol is known and binding: `../docs/ENVIRONMENT.md` (summary of
-> `h100-microbench/docs/environment/README.md`). Every build, run and notebook goes through `tools/run`
-> (this study: the `roofline/tools/run` wrapper created in R0, which selects the roofline image and calls the
-> microbench `tools/run`), on **GPU 3**, with the locked SM clock for every timed or ncu run. Do not invent
+> **IMPORTANT — READ FIRST.** The server protocol is known and binding: `~/h100/H100.md` and
+> `../docs/ENVIRONMENT.md`. Every build, run and notebook goes through `h100 run` (this study: the
+> `roofline/tools/run` wrapper, which adds the study's cache and `PYTHONPATH` variables and calls `h100 run`);
+> GPU runs are queued and pinned to **GPU 3** (`--gpu 3`, the card of every earlier roofline measurement), with
+> the locked SM clock for every timed or ncu run. Do not invent
 > another protocol; if something on the server contradicts that file, stop, tell the user, and record the
 > finding there.
 
@@ -33,7 +34,7 @@ per task. This section replaces steps 2–3 of `../CLAUDE.md` "Starting a new co
    tasks (code to write, runs, GPU time, result files with sizes, commits), one paragraph per later task
    (what is built and run, GPU time, open risks), total GPU and image-build time, and the points where the
    conversation will stop for the user (3). After approval, run all tasks in auto mode.
-3. **Stop and ask the user only** for: the h100-microbench `H100MB_IMAGE` commit (R0 step 4), a prerequisite
+3. **Stop and ask the user only** for: a change to the shared image (`~/h100/docker/`), a prerequisite
    that does not hold, a material deviation from the approved plan (a new dependency outside the image plan,
    a task needing more than 2× its GPU-time estimate, a manifest that cannot be measured beyond what its
    card already allows, a change to `docs/DESIGN.md` methodology), and anything the binding rules forbid
@@ -61,26 +62,28 @@ per task. This section replaces steps 2–3 of `../CLAUDE.md` "Starting a new co
 ## H100 NVL server protocol (binding; details in `../docs/ENVIRONMENT.md`)
 
 - Access: edit, run agents and use git directly in this NFS checkout on `nishil-4xh100-01`; the GPUs are
-  shared with other users, ours are GPU 3 (default) and GPU 2 (only when the user names it).
-- Checking and reserving the GPU: `tools/run` runs the preflight (no foreign process, ≤ 1 GiB used, ≤ 5 %
-  utilisation, no other container given the GPU) and holds the cooperative lock
-  `/tmp/h100-gpu-locks/gpu3.lock` for its container's lifetime. Shared with h100-microbench and
-  `../collectives/`: one GPU job at a time; if the lock is held, wait and retry. Status:
-  `make -C ~/work/fa2026/iacoma/h100-microbench gpu-status`.
+  shared with other users, ours are GPU 2 and GPU 3. The target GPU is set by the user (`h100-target`); this
+  study's GPU runs are pinned to GPU 3 (`roofline/tools/run --gpu 3 …`).
+- Checking and reserving the GPU: GPU jobs enter the user's FCFS queue (shared with h100-microbench and
+  `../collectives/`: one GPU job at a time). Its dispatcher runs the preflight (no foreign process, ≤ 1 GiB
+  used, ≤ 5 % utilisation, no other container given the GPU) and holds the cooperative lock
+  `/tmp/h100-gpu-locks/gpu<N>.lock` for the job. If anyone else uses the GPU, or a running job is ended from
+  outside, the queue **freezes** and the interrupted job stays at the head: report `h100 queue`'s reason to
+  the user and wait (never unfreeze, freeze, switch target or cancel on your own). Status: `h100 status`.
 - Limits: `--profile` is required for ncu counters (`RmProfilingAdminOnly=1`) and for the clock lock
   (`--lock-sm-mhz <LOCK>`, value from h100-microbench `docs/context/10` for GPU 3; GPU measurements wait until
   its GPU-3 bring-up row is `done`). Containers need ≥ 2 GB free scratch, image builds ≥ 40 GB. The 94 GB of
   HBM fit every workload; no model checkpoints are needed (random weights at the real shapes).
 - Where to build and write: in-tree on NFS — `roofline/build/` (variant source worktrees, extensions,
   JIT caches) and `roofline/results/` (both git-ignored); never the container's `/tmp`. Python packages are
-  baked into the image; artifact extensions are built in-tree and put on `PYTHONPATH` (containers are `--rm`,
-  a `pip install` at run time is lost).
-- Clean-up: none beyond `tools/run`'s own. Never `docker run` by hand, never prune, never touch other
+  baked into the image; artifact extensions are built in-tree and put on `PYTHONPATH` (containers are deleted after
+  each job, a `pip install` at run time is lost). New dependencies go into the shared image (`~/h100/docker/`).
+- Clean-up: none beyond the queue's own. Never `docker run` by hand, never prune, never touch other
   users' processes, containers or locks. Never delete results.
 
 ## Workflow (the tasks of `ROADMAP.md`)
 
-1. R0: environment (submodules, roofline image, `tools/run` wrapper), fill `docs/DESIGN.md` §6. Record the
+1. R0: environment (submodules, roofline image, `h100 run` wrapper), fill `docs/DESIGN.md` §6. Record the
    commit hash of this repo.
 2. R1: measure the ceilings (`docs/DESIGN.md` §2.1) and write `results/ceilings.csv`. Do this before any
    workload: a roofline with datasheet ceilings only is not acceptable.
@@ -102,7 +105,7 @@ per task. This section replaces steps 2–3 of `../CLAUDE.md` "Starting a new co
   **per-variant git worktree of the submodule** (`roofline/build/src/<manifest>__<variant>/`, git-ignored),
   never in `third_party/<repo>` itself, which stays clean at its pinned commit.
 - Ceilings are measured with microbenchmarks; datasheet numbers are drawn as dashed references only.
-- Clocks: every timed or ncu run uses `tools/run --profile --lock-sm-mhz <LOCK>`; ncu always with
+- Clocks: every timed or ncu run uses `h100 run --profile --lock-sm-mhz <LOCK>`; ncu always with
   `--clock-control none` (never `base`: it would override our lock), state the clock in the notebook.
   Flush L2 between timed iterations (`CleanL2` / 256 MB write) unless the workload's own harness already
   does; say which.
@@ -113,8 +116,8 @@ per task. This section replaces steps 2–3 of `../CLAUDE.md` "Starting a new co
   (`../docs/ENVIRONMENT.md` §5). Keep raw outputs under `results/` (git-ignored); commit only
   `results/ceilings.csv`, `results/points.csv` (force-added) and the executed notebook, when R8 is done or
   when a task's card says so.
-- New Python or system dependency → add it to `roofline/docker/Dockerfile`, rebuild and re-tag the image
-  (R0's build script), note it in `docs/DESIGN.md` §6. Never install at run time.
+- New Python or system dependency → ask the user, then add it to the shared image (`~/h100/docker/`, `h100 image
+  lock` + `h100 image build`) and note it in `docs/DESIGN.md` §6. Never install at run time.
 - Commit message per task: `roofline/R<n>: <what was done>; <main finding>`.
 
 ## Change log  *(append entries here)*

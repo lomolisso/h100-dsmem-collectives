@@ -3,7 +3,7 @@
  *
  * The collective files declare `__global__ void __cluster_dims__(CLUSTER_N,1,1) collective_kernel(...)`.
  * This probe uses the same declaration form for CS 8 (portable control) and CS 16 (non-portable) and checks,
- * for each CS, on GPU 0 of the container (GPU 3 under tools/run):
+ * for each CS, on GPU 0 of the container (GPU 3 under h100 run):
  *   T0  (CS 16 only) plain <<<CS,256>>> launch *before* NonPortableClusterSizeAllowed is set (expected to fail)
  *   T1  cudaFuncSetAttribute(NonPortableClusterSizeAllowed, 1) (CS 16 only), then plain <<<CS,256>>>
  *   T2  cudaLaunchKernelEx with no launch attributes

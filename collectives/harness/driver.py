@@ -2,10 +2,10 @@
 """driver.py — build matrix and child-process runner for the collectives harness (TESTING.md §1–2).
 
 Run inside the microbench container from anywhere (it chdirs to collectives/):
-  tools/run --no-gpu -- python3 collectives/harness/driver.py build [--jobs 16] [--files F ...] [--N ...] [--M ...] [--T ...] [--force] [--no-mmax]
-  tools/run --profile --lock-sm-mhz <LOCK> -- python3 collectives/harness/driver.py run --mode correctness \
+  h100 run --no-gpu -- python3 collectives/harness/driver.py build [--jobs 16] [--files F ...] [--N ...] [--M ...] [--T ...] [--force] [--no-mmax]
+  h100 run --profile --lock-sm-mhz <LOCK> -- python3 collectives/harness/driver.py run --mode correctness \
         --pattern A --reps 200 --processes 3 [--smoke] [--ops allreduce ...] [--files ...] [--N ...] [--M ...] [--T ...] [--shuffle --seed S]
-  tools/run --no-gpu -- python3 collectives/harness/driver.py summary
+  h100 run --no-gpu -- python3 collectives/harness/driver.py summary
 
 build: one binary per (file, N, M, T): N in {2,4,8,16}; M on the grid {16,64,256,1024,4096,16384} plus, per
   (file, N, T), the largest M whose shared memory fits the 227 KiB per-block limit ("M_max", see below); T = float
@@ -264,7 +264,7 @@ def latest_build():
 class Builder:
     def __init__(self, args, reg):
         if not shutil.which("nvcc"):
-            raise SystemExit("nvcc not found: run inside tools/run --no-gpu")
+            raise SystemExit("nvcc not found: run inside h100 run --no-gpu")
         self.cuda_home = os.path.dirname(os.path.dirname(shutil.which("nvcc")))
         self.args, self.reg, self.rel = args, reg, nvcc_release()
         self.common = max(os.path.getmtime(p) for p in ("harness/main.cu", "dsmem_primitives.cuh",

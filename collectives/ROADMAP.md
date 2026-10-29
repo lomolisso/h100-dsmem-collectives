@@ -50,8 +50,8 @@ bring-up is done; its GPU smoke step cannot. This roadmap does not depend on `ro
   **ReduceScatter (4)** `reducescatter__{ring__nccl, recursive_halving__mpich, direct_push__generic, direct_pull__generic}`;
   **AlltoAll (6)** `alltoall__{pairwise_exchange__fa4, direct_push__generic, pairwise_xor__mpich, shift__generic, bruck__mpich, direct_pull__generic}`.
   Per-file rounds, message sizes, traffic and N constraints: `README.md`.
-- Commands: `TR=~/work/fa2026/iacoma/h100-microbench/tools/run`; builds `$TR --no-gpu -- …`; GPU runs
-  `$TR --profile --lock-sm-mhz <LOCK> -- …` on GPU 3 (`<LOCK>` from h100-microbench `docs/context/10` §2).
+- Commands: `TR="h100 run"` (`~/h100/H100.md`); builds `$TR --no-gpu -- …`; GPU runs (queued, pinned to GPU 3)
+  `$TR --gpu 3 --profile --lock-sm-mhz <LOCK> -- …` (`<LOCK>` from h100-microbench `docs/context/10` §2).
 - Results: `collectives/results/` (git-ignored), mandatory columns first, append-only, run registry
   `results/collectives__runs.csv`. Builds: `collectives/build/` (git-ignored).
 - The algorithm files are modifiable: they are untested, and every task fixes what its checks show is wrong
@@ -75,7 +75,7 @@ configurations.
 
 **Steps.**
 1. Record the tooling in `CLAUDE.md` → *Tooling*: `$TR --no-gpu -- nvcc --version`, `ncu --version`,
-   image tag (`tools/env info`), driver; the commit of this repo.
+   image tag (`h100 image info`), driver; the commit of this repo.
 2. Vendor `common/h100mb/` per `../docs/REUSE.md` §1/§4 (skip if roofline R1 already did; then only verify
    `PROVENANCE.md`).
 3. Repository hygiene: `.claude/settings.json` (`../docs/ENVIRONMENT.md` §6); confirm `.gitignore` covers

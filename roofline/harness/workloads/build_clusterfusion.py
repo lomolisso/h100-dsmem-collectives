@@ -6,7 +6,7 @@
 
 Why a wrapper: upstream `setup.py` picks the target from `torch.cuda.get_device_properties(0)` at import time
 (`_get_arch()`: sm_90 -> sources of include/H100/, `-gencode arch=compute_90a,code=sm_90a`, `-DCOMPILE_SM90`),
-so `python setup.py build_ext` fails in a `tools/run --no-gpu` container. This script stubs the three torch.cuda
+so `python setup.py build_ext` fails in a `h100 run --no-gpu` container. This script stubs the three torch.cuda
 queries to report an sm_90 device (the H100 NVL of the study) and then runs the unmodified `setup.py build_ext
 --inplace` (no `pip install -e .`: `pyproject.toml` would need build isolation, and containers are `--rm`). The
 result is `clusterfusion/_clusterfusion*.so` inside the worktree; the manifests put the worktree on PYTHONPATH.

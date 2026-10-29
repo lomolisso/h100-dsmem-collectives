@@ -104,7 +104,7 @@ class Device:
         self.uuid = os.environ.get("H100MB_GPU_UUID", "")
         if self.uuid:
             self.h = pynvml.nvmlDeviceGetHandleByUUID(self.uuid)
-        else:  # tools/run always sets it; outside tools/run use the only visible GPU
+        else:  # h100 run always sets it; outside h100 run use the only visible GPU
             self.h = pynvml.nvmlDeviceGetHandleByIndex(0)
             self.uuid = _s(pynvml.nvmlDeviceGetUUID(self.h))
         self.driver_version = _s(pynvml.nvmlSystemGetDriverVersion())
